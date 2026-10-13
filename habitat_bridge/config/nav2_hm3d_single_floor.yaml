@@ -1,0 +1,236 @@
+# Nav2 parameters for running go2_frontier_exploration in Habitat-sim (ROS 2 Humble).
+# Based on frontier_exploration/config/nav2.yaml (Go2), with these changes:
+#   * use_sim_time: True everywhere (time comes from /clock published by habitat_bridge).
+#     Every node section lists it, because RewrittenYaml only rewrites keys that exist.
+#   * recoveries_server (Foxy/Galactic name) -> behavior_server (Humble), plugins nav2_behaviors/*
+#   * smoother_server and velocity_smoother sections added (Humble navigation_launch.py starts them)
+#   * amcl / map_server removed: slam_toolbox provides map and map->odom
+# Robot size: Nav2 robot_radius (0.22) is kept slightly SMALLER than habitat_server.py
+# --agent-radius (0.25). The simulator then stops the robot before Nav2 thinks it is in
+# collision, so Nav2 never ends up "inside" an obstacle with every trajectory invalid
+# (it just sees no progress and replans).
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: True
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    enable_groot_monitoring: False
+    plugin_lib_names:
+    - nav2_compute_path_to_pose_action_bt_node
+    - nav2_compute_path_through_poses_action_bt_node
+    - nav2_follow_path_action_bt_node
+    - nav2_back_up_action_bt_node
+    - nav2_spin_action_bt_node
+    - nav2_wait_action_bt_node
+    - nav2_clear_costmap_service_bt_node
+    - nav2_is_stuck_condition_bt_node
+    - nav2_goal_reached_condition_bt_node
+    - nav2_goal_updated_condition_bt_node
+    - nav2_initial_pose_received_condition_bt_node
+    - nav2_reinitialize_global_localization_service_bt_node
+    - nav2_rate_controller_bt_node
+    - nav2_distance_controller_bt_node
+    - nav2_speed_controller_bt_node
+    - nav2_truncate_path_action_bt_node
+    - nav2_goal_updater_node_bt_node
+    - nav2_recovery_node_bt_node
+    - nav2_pipeline_sequence_bt_node
+    - nav2_round_robin_node_bt_node
+    - nav2_transform_available_condition_bt_node
+    - nav2_time_expired_condition_bt_node
+    - nav2_distance_traveled_condition_bt_node
+    - nav2_single_trigger_bt_node
+    - nav2_is_battery_low_condition_bt_node
+    - nav2_navigate_through_poses_action_bt_node
+    - nav2_navigate_to_pose_action_bt_node
+    - nav2_remove_passed_goals_action_bt_node
+    - nav2_planner_selector_bt_node
+    - nav2_controller_selector_bt_node
+    - nav2_goal_checker_selector_bt_node
+
+bt_navigator_rclcpp_node:
+  ros__parameters:
+    use_sim_time: True
+
+controller_server:
+  ros__parameters:
+    use_sim_time: True
+    controller_frequency: 20.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.2
+      movement_time_allowance: 10.0
+    general_goal_checker:
+      stateful: True
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.25
+      yaw_goal_tolerance: 3.15   # frontier goals carry no meaningful heading (w=1); don't spin at arrival
+    # Regulated Pure Pursuit (RPP) instead of RotationShim + DWB.
+    # In the narrow kitchen aisle the robot kept turning left/right on the spot: the global
+    # path is re-sent every second, and on each new path RotationShim rotated toward the path
+    # point 0.5 m ahead - which, at a U-turn around the island, lies around the corner - after
+    # which DWB turned it back toward the local path direction. RPP just follows the global
+    # path (already kept off obstacles by the inflation layer), turns in place when the path
+    # is far off its heading, and slows down near obstacles and in tight curves.
+    FollowPath:
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      desired_linear_vel: 0.4
+      lookahead_dist: 0.5
+      min_lookahead_dist: 0.3
+      max_lookahead_dist: 0.8
+      lookahead_time: 1.5
+      use_velocity_scaled_lookahead_dist: true
+      rotate_to_heading_angular_vel: 0.8
+      transform_tolerance: 1.0
+      min_approach_linear_velocity: 0.05
+      approach_velocity_scaling_dist: 0.6
+      use_collision_detection: true
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      use_regulated_linear_velocity_scaling: true
+      use_cost_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.9
+      regulated_linear_scaling_min_speed: 0.15
+      cost_scaling_dist: 0.4
+      cost_scaling_gain: 1.0
+      inflation_cost_scaling_factor: 3.0      # = inflation_layer cost_scaling_factor
+      use_rotate_to_heading: true
+      rotate_to_heading_min_angle: 0.6        # rad; turn in place if the path is more than ~35 deg off
+      max_angular_accel: 1.5
+      allow_reversing: false
+      max_robot_pose_search_dist: 10.0
+      use_interpolation: true
+
+# Costmaps read obstacles only from /map (StaticLayer), not from /scan.
+# The scan-based Obstacle/Voxel layers feed scans through tf2_ros::MessageFilter. In these
+# runs the controller_server's TF buffer froze at a random moment ("latest data is at time X"
+# forever, local costmap stuck in place while the robot moved on), while other Nav2 processes
+# kept receiving TF: the signature of the tf2 MessageFilter deadlock under high-rate scans.
+# In simulation /map already contains every scan return (and navmesh obstacles), refreshed at
+# 1 Hz, and the world is static, so the scan layers add nothing but that risk.
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: True
+      update_frequency: 5.0
+      publish_frequency: 5.0
+      global_frame: odom
+      robot_base_frame: base_link
+      transform_tolerance: 0.5
+      rolling_window: true
+      width: 3
+      height: 3
+      resolution: 0.05                # = /map resolution
+      robot_radius: 0.22
+      plugins: ["static_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.55        # Go2: 0.3. Wider in sim so paths keep off furniture
+      always_send_full_costmap: True
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: True
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      transform_tolerance: 0.5
+      robot_radius: 0.22
+      resolution: 0.05                # = /map resolution
+      track_unknown_space: true
+      plugins: ["static_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.55        # Go2: 0.3. Wider in sim so paths keep off furniture
+      always_send_full_costmap: True
+
+planner_server:
+  ros__parameters:
+    use_sim_time: True
+    expected_planner_frequency: 20.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.5
+      use_astar: false
+      allow_unknown: true
+
+smoother_server:
+  ros__parameters:
+    use_sim_time: True
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: True
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: True
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
+    spin:
+      plugin: "nav2_behaviors/Spin"
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors/DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors/Wait"
+    global_frame: odom
+    robot_base_frame: base_link
+    transform_tolerance: 0.1
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 0.8
+    min_rotational_vel: 0.4
+    rotational_acc_lim: 1.5
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: True
+    smoothing_frequency: 20.0
+    scale_velocities: False
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.4, 0.0, 0.8]
+    min_velocity: [-0.4, 0.0, -0.8]
+    max_accel: [1.3, 0.0, 1.5]
+    max_decel: [-0.8, 0.0, -1.0]
+    odom_topic: "odom"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: True
+    loop_rate: 20
+    stop_on_failure: false
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: True
+      waypoint_pause_duration: 200
