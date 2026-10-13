@@ -45,6 +45,9 @@ class FrontierExplorer : public rclcpp::Node
     private:
         int region_size_thresh_ {1};
         float robot_width_ {0.5};
+        // > 0: move each goal to the nearest known-free cell that is at least this far (m)
+        // from any occupied cell, instead of the straight-line pullback toward the robot.
+        double goal_clearance_ {0.0};
 
         std::string occupancy_map_topic_ {"map"}; //"global_costmap/costmap"
         
@@ -70,6 +73,8 @@ class FrontierExplorer : public rclcpp::Node
             std::shared_ptr<frontier_interfaces::srv::FrontierGoal::Response> response);
 
         void publishFrontiers();
+
+        bool snapToClearCell(const nav_msgs::msg::OccupancyGrid & map, double & x, double & y) const;
 
         std::shared_ptr<tf2_ros::TransformListener> tf_listener_{nullptr};
         std::unique_ptr<tf2_ros::Buffer> tf_buffer_;

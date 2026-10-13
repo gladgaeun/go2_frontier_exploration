@@ -10,6 +10,9 @@
  */
 #include "frontier_exploration/classical_frontier_detector.hpp"
 
+#include <cmath>
+#include <queue>
+
 FrontierExplorer::FrontierExplorer()
 : Node("frontier_explorer")
 {
@@ -17,6 +20,7 @@ FrontierExplorer::FrontierExplorer()
     region_size_thresh_ = this->declare_parameter("region_size_thresh", 4);
     robot_width_ = this->declare_parameter("robot_width", 0.5);
     occupancy_map_topic_ = this->declare_parameter("occupancy_map_msg", "map");
+    goal_clearance_ = this->declare_parameter("goal_clearance", 0.0);
 
     // Subscribers/Publichers/Service setup
     map_subscription_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
@@ -68,6 +72,8 @@ void FrontierExplorer::get_frontiers(const std::shared_ptr<frontier_interfaces::
     // Copy the map
     std::unique_lock<std::mutex> lck(mutex_);
     std::vector<frontierRegion> regions = frontierRegions_;
+    nav_msgs::msg::OccupancyGrid map_copy;
+    if (goal_clearance_ > 0.0) map_copy = map_;
     lck.unlock();
 
     // // Pre-process the grid cell map
@@ -111,7 +117,15 @@ void FrontierExplorer::get_frontiers(const std::shared_ptr<frontier_interfaces::
     double gy = goal.y;
 
     // Apply goal pullback only when a valid frontier exists (size > 0)
-    if (goal.size > 0) {
+    if (goal.size > 0 && goal_clearance_ > 0.0) {
+        // The straight line toward the robot can cross furniture (e.g. a frontier on the far
+        // side of a kitchen island), which put goals inside the inflated obstacle zone.
+        if (!snapToClearCell(map_copy, gx, gy)) {
+            RCLCPP_WARN(this->get_logger(),
+                "No free cell with %.2f m clearance near frontier (%.2f, %.2f); sending it as is.",
+                goal_clearance_, gx, gy);
+        }
+    } else if (goal.size > 0) {
         double dist_to_robot = std::hypot(gx - rx, gy - ry);
         if (dist_to_robot > 0.8) {
             double pullback = 0.3; // Pull back 0.3m toward the robot (into open space)
@@ -126,7 +140,10 @@ void FrontierExplorer::get_frontiers(const std::shared_ptr<frontier_interfaces::
     // Create and init message
     geometry_msgs::msg::PoseStamped goal_pose;
     goal_pose.header.stamp = this->get_clock()->now();
-    goal_pose.header.frame_id = map_frame_;
+    // An empty frame_id tells the client that no valid frontier exists for this rank.
+    // (Using (0,0) as a marker breaks when a real frontier lies at the map origin,
+    // which is the robot start pose in SLAM/Habitat.)
+    goal_pose.header.frame_id = (goal.size > 0) ? map_frame_ : "";
     goal_pose.pose.position.x = gx; // Assign the computed safe position (gx)
     goal_pose.pose.position.y = gy; // Assign the computed safe position (gy)
     goal_pose.pose.position.z = 0.0;
@@ -141,6 +158,68 @@ void FrontierExplorer::get_frontiers(const std::shared_ptr<frontier_interfaces::
 
     RCLCPP_INFO(this->get_logger(), "Sending goal x: %f y: %f.",
         goal_pose.pose.position.x, goal_pose.pose.position.y);
+}
+
+bool FrontierExplorer::snapToClearCell(const nav_msgs::msg::OccupancyGrid & map, double & x, double & y) const
+{
+    const int w = static_cast<int>(map.info.width);
+    const int h = static_cast<int>(map.info.height);
+    const double res = map.info.resolution;
+    if (w == 0 || h == 0 || map.data.size() != static_cast<size_t>(w * h)) return false;
+    const double ox = map.info.origin.position.x;
+    const double oy = map.info.origin.position.y;
+
+    int sx = static_cast<int>(std::floor((x - ox) / res));
+    int sy = static_cast<int>(std::floor((y - oy) / res));
+    if (sx < 0 || sy < 0 || sx >= w || sy >= h) return false;
+
+    const int r = static_cast<int>(std::ceil(goal_clearance_ / res));
+    const int max_steps = static_cast<int>(std::ceil(2.0 / res));   // search up to ~2 m away
+    auto is_free = [&](int cx, int cy) { return map.data[cy * w + cx] == 0; };
+    auto is_clear = [&](int cx, int cy) {
+        for (int dy = -r; dy <= r; ++dy) {
+            for (int dx = -r; dx <= r; ++dx) {
+                if (dx * dx + dy * dy > r * r) continue;
+                int nx = cx + dx, ny = cy + dy;
+                if (nx < 0 || ny < 0 || nx >= w || ny >= h) return false;
+                if (map.data[ny * w + nx] > 50) return false;   // occupied
+            }
+        }
+        return true;
+    };
+
+    // Breadth-first search outward from the frontier centroid through known-free cells,
+    // so the goal stays on the same side of walls/furniture as the frontier itself.
+    std::vector<int> dist(w * h, -1);
+    std::queue<std::pair<int, int>> q;
+    q.push({sx, sy});
+    dist[sy * w + sx] = 0;
+    const int nbr[8][2] = {{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
+    while (!q.empty()) {
+        auto [cx, cy] = q.front();
+        q.pop();
+        if (is_free(cx, cy) && is_clear(cx, cy)) {
+            x = ox + (cx + 0.5) * res;
+            y = oy + (cy + 0.5) * res;
+            return true;
+        }
+        int d = dist[cy * w + cx];
+        if (d >= max_steps) continue;
+        for (auto & n : nbr) {
+            int nx = cx + n[0], ny = cy + n[1];
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+            if (dist[ny * w + nx] >= 0) continue;
+            int8_t v = map.data[ny * w + nx];
+            // Never expand through obstacles. Unknown cells only right next to the start
+            // (the centroid can sit on the unknown side of the frontier line), so the search
+            // cannot tunnel through unexplored furniture to the far side.
+            if (v > 50) continue;
+            if (v != 0 && d >= 4) continue;
+            dist[ny * w + nx] = d + 1;
+            q.push({nx, ny});
+        }
+    }
+    return false;
 }
 
 void FrontierExplorer::publishFrontiers()

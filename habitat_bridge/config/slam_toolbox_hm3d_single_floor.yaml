@@ -1,0 +1,78 @@
+# slam_toolbox (online async, ROS 2 Humble) parameters for Habitat-sim.
+# Odometry from the simulator is exact. Scan matching and loop closing are therefore OFF:
+# with them on, slam_toolbox fell seconds behind ("Transform data too old ... map to odom")
+# and its corrections made map->odom jump, so Nav2 chased a stale pose and the robot spun.
+# Set both to true only if you want to test SLAM itself (e.g. with noisy odometry).
+#
+# Even without matching, slam_toolbox's map->odom stamp lagged 1-3 s behind the scans
+# while it rebuilt the map, and Nav2 rejected it. With exact odometry map->odom is the
+# identity, so habitat_bridge publishes it as a static TF and slam_toolbox only builds
+# the map (transform_publish_period: 0.0 = never publish map->odom).
+# Used only with `mapper:=slam_toolbox`; the launch file then sets transform_publish_period
+# 0.05 and the bridge stops publishing map->odom. Default (`mapper:=gt`) does not run SLAM.
+slam_toolbox:
+  ros__parameters:
+    use_sim_time: True
+
+    # Plugin params
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    # ROS params
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan
+    mode: mapping
+
+    debug_logging: false
+    throttle_scans: 1
+    transform_publish_period: 0.0
+    map_update_interval: 1.0          # faster map updates -> fresher frontiers
+    resolution: 0.05
+    max_laser_range: 10.0             # = habitat_server.py --max-range
+    minimum_time_interval: 0.5
+    transform_timeout: 0.2
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+    enable_interactive_mode: false
+
+    # General params
+    use_scan_matching: false
+    use_scan_barycenter: true
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.2
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+    loop_search_maximum_distance: 3.0
+    do_loop_closing: false
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    # Correlation params
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+
+    # Loop closure correlation params
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # Scan matcher params
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true

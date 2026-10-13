@@ -24,9 +24,9 @@ def generate_launch_description():
         name='classical_frontier_detector',
         output='screen',
         parameters=[
-            {"region_size_thresh_": 4},
-            {"robot_width_": 0.4},
-            {"occupancy_map_topic_": "map"}
+            {"region_size_thresh": 4},
+            {"robot_width": 0.4},
+            {"occupancy_map_msg": "map"}
         ]
     )
 

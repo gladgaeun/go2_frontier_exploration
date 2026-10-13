@@ -26,7 +26,8 @@ std::vector<cell> computeFrontierCellGrid(std::vector<cell> &occupancyGrid, int 
 std::vector<frontierRegion> computeFrontierRegions(std::vector<cell> &frontierCellGrid, int width, int height,
     float resolution, float origin_x, float origin_y, int region_size_thresh);
 
-std::vector<std::pair<int,int>> getNeighbours(int row, int col, int minRow, int minCol, int maxRow, int maxCol);
+std::vector<std::pair<int,int>> getNeighbours(int row, int col, int minRow, int minCol, int maxRow, int maxCol,
+    std::vector<int> dr, std::vector<int> dc, int numberOfConnections);
 
 bool hasCellValue(std::vector<cell> &grid, int width, std::vector<std::pair<int,int>> cells, int value);
 
