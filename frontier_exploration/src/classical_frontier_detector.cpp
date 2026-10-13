@@ -126,7 +126,10 @@ void FrontierExplorer::get_frontiers(const std::shared_ptr<frontier_interfaces::
     // Create and init message
     geometry_msgs::msg::PoseStamped goal_pose;
     goal_pose.header.stamp = this->get_clock()->now();
-    goal_pose.header.frame_id = map_frame_;
+    // An empty frame_id tells the client that no valid frontier exists for this rank.
+    // (Using (0,0) as a marker breaks when a real frontier lies at the map origin,
+    // which is the robot start pose in SLAM/Habitat.)
+    goal_pose.header.frame_id = (goal.size > 0) ? map_frame_ : "";
     goal_pose.pose.position.x = gx; // Assign the computed safe position (gx)
     goal_pose.pose.position.y = gy; // Assign the computed safe position (gy)
     goal_pose.pose.position.z = 0.0;

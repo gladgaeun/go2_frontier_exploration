@@ -204,11 +204,19 @@ vector<frontierRegion> computeFrontierRegions(vector<cell> &frontierCellGrid, in
                 }
             }
             
+            // Regions smaller than the threshold must be discarded here; otherwise their
+            // cells leak into the next region and shift its centroid.
+            if (newRegion.size > 0 && newRegion.size < region_size_thresh){
+                newRegion.size = 0;
+                newRegion.x = 0;
+                newRegion.y = 0;
+            }
+
             if (newRegion.size >= region_size_thresh){
                 
-                // Average Summed Cell Coordinates
-                newRegion.x /= newRegion.size;
-                newRegion.y /= newRegion.size;
+                // Average Summed Cell Coordinates (+0.5 = centre of the cell)
+                newRegion.x = newRegion.x / newRegion.size + 0.5f;
+                newRegion.y = newRegion.y / newRegion.size + 0.5f;
 
                 // Convert units from pixel to meter
                 newRegion.x *= resolution;

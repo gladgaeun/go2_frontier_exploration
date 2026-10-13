@@ -123,15 +123,15 @@ class FrontierExplorer(Node):
                 return "Done"
 
             # Handle dummy/invalid goals by retrying or completing exploration
-            if goal.pose.position.x == 0.0 and goal.pose.position.y == 0.0:
+            if self.is_empty_goal(goal):
                 if rank == 0:
                     for _ in range(5):
                         import time
                         time.sleep(1.0)
                         goal = self.send_request(0)
-                        if goal is not None and not (goal.pose.position.x == 0.0 and goal.pose.position.y == 0.0):
+                        if not self.is_empty_goal(goal):
                             break
-                    if goal.pose.position.x == 0.0 and goal.pose.position.y == 0.0:
+                    if self.is_empty_goal(goal):
                         return "Done"
                 else:
                     return "Done"
@@ -176,6 +176,11 @@ class FrontierExplorer(Node):
             if rank > 20:
                 return None
             rank += 1
+
+    @staticmethod
+    def is_empty_goal(goal):
+        # The detector answers with an empty frame_id when there is no frontier for this rank
+        return goal is None or goal.header.frame_id == ''
 
     def send_request(self, rank):
         self.req.goal_rank = rank
