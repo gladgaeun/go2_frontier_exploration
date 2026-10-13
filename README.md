@@ -86,26 +86,61 @@ ros2 run nav2_map_server map_saver_cli -f ~/my_go2_map
 
 ## HM3D (Habitat-sim)
 
+Requires [Habitat-sim](https://github.com/facebookresearch/habitat-sim) 0.3.0 in a conda env and
+the HM3D dataset. See [habitat_bridge/README.md](habitat_bridge/README.md) for installation and
+dataset download.
+
+**Terminal 1** — start the Habitat simulator server (conda env) and wait for
+`listening on tcp://127.0.0.1:5555`:
+
 ```bash
-# Terminal 1 (conda env with habitat-sim 0.3.0)
+conda activate habitat
 python ~/ros2_ws/src/go2_frontier_exploration/habitat_bridge/scripts/habitat_server.py \
     --scene ~/data/versioned_data/hm3d-0.2/hm3d/val/00800-TEEsavR23oF/TEEsavR23oF.basis.glb
-# Terminal 2 (ROS)
+```
+
+**Terminal 2** — start the bridge, Nav2 and frontier exploration (RViz + frontier detector +
+exploration node), in a new terminal without conda:
+
+```bash
+cd ~/ros2_ws
+source install/setup.bash
 ros2 launch habitat_bridge hm3d_single_floor_exploration.launch.py
 ```
 
-Dataset download, installation, log guide and results:
-[habitat_bridge/README.md](habitat_bridge/README.md).
+**Optional** — repeat the same run with the start pose printed in Terminal 1:
+
+```bash
+python ~/ros2_ws/src/go2_frontier_exploration/habitat_bridge/scripts/habitat_server.py \
+    --scene <scene.basis.glb> --start -9.457,0.163,-0.633,-1.566
+```
+
+**Save the map** after `Exploration complete!` (while Terminal 1 is still running):
+
+```bash
+ros2 run nav2_map_server map_saver_cli -f ~/my_hm3d_map
+```
 
 ### Results on HM3D
 
 Single-floor frontier-based exploration in Habitat-sim on HM3D scene `00800-TEEsavR23oF` (ground floor).
 The robot maps the whole floor and stops by itself when no frontier is left.
 
+**RViz legend**
+
+| Marker | Meaning |
+| --- | --- |
+| Red arrow (Odometry) | Current robot position and heading |
+| Light-blue circle (Footprint) | Robot outline as seen by Nav2; should move together with the arrow |
+| Semi-transparent colored map (Local Costmap) | 3×3 m obstacle map around the robot; should move with the robot |
+| Green line / pink line | Global path / local path |
+| Green dots | Frontier cells |
+| Red dots | Clustered frontier centroids |
+
 <p align="center">
   <img width="520" alt="HM3D single-floor exploration" src="https://github.com/user-attachments/assets/7393a0b0-01dd-452c-b030-8a3e6689fdf4">
 </p>
-<p align="center"><em>4.5x speed. Left: robot camera view. Right: occupancy map, frontiers (green), frontier goals (red), local costmap.</em></p>
+<p align="center"><em>4.5x speed. Left: robot camera view. Right: occupancy map with the markers listed in the RViz legend.</em></p>
 
 | Scene | Exploration time (sim) | Path length | Failed goals | Mapped free area |
 |---|---|---|---|---|
