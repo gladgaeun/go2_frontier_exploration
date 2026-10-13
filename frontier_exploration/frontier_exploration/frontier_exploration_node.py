@@ -39,6 +39,12 @@ class FrontierExplorer(Node):
         self.goal_pose = PoseStamped()
         self.failed_goals = []
 
+        # If True, a frontier goal the robot already reached is not sent again. A frontier that
+        # is still there after the robot stood at it cannot be observed from there (unknown
+        # space behind a wall, under furniture, ...), so going back only repeats the same trip.
+        self.skip_reached_goals = self.declare_parameter('skip_reached_goals', False).value
+        self.reached_goals = []
+
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -106,6 +112,8 @@ class FrontierExplorer(Node):
             # Allow time for SLAM to expand the map with new LiDAR scans upon goal arrival
             if result == NavigationResult.SUCCEEDED:
                 time.sleep(1.0)
+                if self.skip_reached_goals:
+                    self.reached_goals.append((self.goal_pose.pose.position.x, self.goal_pose.pose.position.y))
 
             # Add to blacklist on failure/cancellation to prevent goal ping-pong loops
             if result == NavigationResult.FAILED or result == NavigationResult.CANCELED:
@@ -142,7 +150,7 @@ class FrontierExplorer(Node):
 
             # Check if the candidate goal is near a previously blacklisted position (within 0.5m)
             is_blacklisted = False
-            for fg in self.failed_goals:
+            for fg in self.failed_goals + self.reached_goals:
                 if math.hypot(goal.pose.position.x - fg[0], goal.pose.position.y - fg[1]) < 0.5:
                     is_blacklisted = True
                     break
