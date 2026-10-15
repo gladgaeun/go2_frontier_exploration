@@ -80,7 +80,7 @@ ros2 run nav2_map_server map_saver_cli -f ~/my_go2_map
 ### Results on Go2
 
 <p align="center">
-  <img width="520" alt="Frontier exploration with Unitree Go2" src="https://github.com/user-attachments/assets/2647a688-161d-46e1-ae49-25cfb4daa54a">
+  <img width="520" alt="Frontier exploration with Unitree Go2" src="docs/images/Go2_single_floor_exploration.gif">
 </p>
 <p align="center"><em>Frontier-based exploration with Unitree Go2 in an indoor environment.</em></p>
 
@@ -138,7 +138,7 @@ The robot maps the whole floor and stops by itself when no frontier is left.
 | Red dots | Clustered frontier centroids |
 
 <p align="center">
-  <img width="520" alt="HM3D single-floor exploration" src="https://github.com/user-attachments/assets/7393a0b0-01dd-452c-b030-8a3e6689fdf4">
+  <img width="520" alt="HM3D single-floor exploration" src="docs/images/hm3d_single_floor_exploration.gif">
 </p>
 <p align="center"><em>4.5x speed. Left: robot camera view. Right: occupancy map with the markers listed in the RViz legend.</em></p>
 
