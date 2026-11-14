@@ -1,5 +1,6 @@
 # Full stack for frontier exploration in Habitat-sim:
 #   habitat_bridge -> slam_toolbox -> Nav2 -> classical_frontier_detector -> frontier_exploration_node
+#   (+ voxel_mapper_node: 3D voxel map from the RGB-D camera, voxel_map:=false to disable)
 #
 # Start habitat_server.py (conda env) first, then:
 #   ros2 launch habitat_bridge hm3d_single_floor_exploration.launch.py
@@ -10,7 +11,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 from launch.conditions import IfCondition, LaunchConfigurationEquals
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -43,6 +44,11 @@ def generate_launch_description():
         DeclareLaunchArgument('mapper', default_value='gt', choices=['gt', 'slam_toolbox'],
                               description='gt: occupancy map from the exact simulator pose (default). '
                                           'slam_toolbox: run SLAM like on the real Go2.'),
+        DeclareLaunchArgument('voxel_map', default_value='true',
+                              description='build the 3D voxel map (occupancy + traversability) from RGB-D'),
+        DeclareLaunchArgument('frontier_map', default_value='map', choices=['map', 'voxel'],
+                              description='map: frontiers from the 2D /map. voxel: from the voxel '
+                                          'traversability grid voxel_map/trav_grid (needs voxel_map:=true)'),
     ]
 
     # Publishes /clock itself, so it must run on wall time.
@@ -50,6 +56,18 @@ def generate_launch_description():
         package='habitat_bridge', executable='bridge_node', name='habitat_bridge', output='screen',
         parameters=[{'use_sim_time': False, 'zmq_address': zmq_address,
                      'mapper': LaunchConfiguration('mapper')}])
+
+    # RGB-D -> occupancy log-odds -> inflation, 2D ray casting -> M_g, M_trav (trav_exploration;
+    # not declared in package.xml: trav_exploration depends on this package, voxel_map:=false
+    # runs without it)
+    voxel = Node(
+        package='trav_exploration', executable='voxel_mapper_node', name='voxel_mapper', output='screen',
+        condition=IfCondition(LaunchConfiguration('voxel_map')),
+        parameters=[{'use_sim_time': True,
+                     'resolution': 0.05,
+                     'robot_radius': 0.22,     # = Nav2 robot_radius, below server --agent-radius
+                     'h_max': 0.6,             # = server --agent-height
+                     'max_range': 5.0}])       # TravExplorer sim: depth 0-5 m
 
     # Only with mapper:=slam_toolbox. It then owns map->odom (the bridge does not publish it).
     slam = Node(
@@ -72,7 +90,9 @@ def generate_launch_description():
                      'robot_width': 0.5,
                      # move goals to a known-free cell >= 0.4 m from obstacles (Go2 launch: off)
                      'goal_clearance': 0.4,
-                     'occupancy_map_msg': 'map'}])
+                     'occupancy_map_msg': PythonExpression(
+                         ["'voxel_map/trav_grid' if '", LaunchConfiguration('frontier_map'),
+                          "' == 'voxel' else 'map'"])}])
 
     # No name= here: this process holds two nodes (frontier_explorer + basic_navigator) and
     # name= would rename both to the same name.
@@ -92,4 +112,4 @@ def generate_launch_description():
         parameters=[{'use_sim_time': True}],
         condition=IfCondition(rviz))
 
-    return LaunchDescription(args + [bridge, slam, nav2, detector, explorer, rviz_node])
+    return LaunchDescription(args + [bridge, voxel, slam, nav2, detector, explorer, rviz_node])

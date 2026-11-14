@@ -119,6 +119,9 @@ controller_server:
 # kept receiving TF: the signature of the tf2 MessageFilter deadlock under high-rate scans.
 # In simulation /map already contains every scan return (and navmesh obstacles), refreshed at
 # 1 Hz, and the world is static, so the scan layers add nothing but that risk.
+# The one obstacle layer, blocked_layer, reads voxel_map/blocked from voxel_mapper_node: cells
+# where the robot got stuck (TravExplorer eq. 17), e.g. a hole in an HM3D wall that /map shows
+# as free. It is published at <= 1 Hz in the map frame, far from the scan rates above.
 local_costmap:
   local_costmap:
     ros__parameters:
@@ -133,10 +136,22 @@ local_costmap:
       height: 3
       resolution: 0.05                # = /map resolution
       robot_radius: 0.22
-      plugins: ["static_layer", "inflation_layer"]
+      plugins: ["static_layer", "blocked_layer", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
+      blocked_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        observation_sources: blocked
+        blocked:
+          topic: /voxel_map/blocked
+          data_type: "PointCloud2"
+          marking: true
+          clearing: false
+          min_obstacle_height: -1.0     # voxels sit just above the floor, which is below base_link
+          max_obstacle_height: 2.0
+          obstacle_max_range: 100.0     # range is measured from the cloud origin = map origin
+          expected_update_rate: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
@@ -155,10 +170,22 @@ global_costmap:
       robot_radius: 0.22
       resolution: 0.05                # = /map resolution
       track_unknown_space: true
-      plugins: ["static_layer", "inflation_layer"]
+      plugins: ["static_layer", "blocked_layer", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
+      blocked_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        observation_sources: blocked
+        blocked:
+          topic: /voxel_map/blocked
+          data_type: "PointCloud2"
+          marking: true
+          clearing: false
+          min_obstacle_height: -1.0     # voxels sit just above the floor, which is below base_link
+          max_obstacle_height: 2.0
+          obstacle_max_range: 100.0     # range is measured from the cloud origin = map origin
+          expected_update_rate: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
