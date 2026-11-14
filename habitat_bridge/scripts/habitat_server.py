@@ -7,7 +7,10 @@
 #
 # Protocol (ZMQ REQ/REP, multipart messages):
 #   request : [json]   {"op": "info"} | {"op": "reset"} | {"op": "step", "vx": m/s, "wz": rad/s, "dt": s}
-#   reply   : [json header, scan float32 bytes, rgb uint8 bytes (may be empty)]
+#   reply   : [json header, scan float32 bytes, rgb uint8 bytes, depth float32 bytes,
+#              semantic uint8 bytes]
+#             (rgb/depth/semantic may be empty; depth is z-depth in m from the RGB camera, 0 = no
+#             hit; semantic is a class code per pixel of the RGB camera, see SEMANTIC_CLASSES)
 #
 # Coordinate frames
 #   Habitat world : x right, y up, z backward (agent looks along -z)
@@ -75,6 +78,65 @@ def depth_to_scan(depth_rows, lut, max_range, min_range=0.1):
     return r.astype(np.float32)
 
 
+# --semantic: ground-truth classes of the HM3D semantic annotation, as a segmentation model would
+# give them for the prompts of TravExplorer's semantic traversability (floor, stair, rug) and the
+# stair landmark. One code per pixel (uint8); SAM3 later produces the same image.
+SEMANTIC_CLASSES = {'other': 0, 'floor': 1, 'rug': 2, 'stairs': 3}
+SEMANTIC_NAMES = {
+    'floor': ('floor', 'flooring', 'ground'),
+    'rug': ('rug', 'carpet', 'mat', 'floor mat', 'bath mat', 'doormat', 'door mat', 'yoga mat'),
+    'stairs': ('stairs', 'stair', 'staircase', 'step', 'steps', 'stair step'),
+}
+
+
+def semantic_class(category):
+    """Class code of an HM3D category name (exact names: 'floor lamp' is not floor)."""
+    name = category.strip().lower()
+    for cls, names in SEMANTIC_NAMES.items():
+        if name in names:
+            return SEMANTIC_CLASSES[cls]
+    return SEMANTIC_CLASSES['other']
+
+
+def find_dataset_config(scene):
+    """hm3d_annotated_*scene_dataset_config.json in a parent directory of the scene file."""
+    import glob
+    import os
+    d = os.path.dirname(os.path.abspath(scene))
+    for _ in range(4):
+        hits = sorted(glob.glob(os.path.join(d, '*annotated*scene_dataset_config.json')))
+        if hits:
+            return hits[0]
+        d = os.path.dirname(d)
+    return ''
+
+
+def floor_drop(depth, hfov_deg, rows=0.15, cols=0.5, lo=0.3, hi=2.5, bin_size=0.005):
+    """Height of the camera above the floor from z-depth images of a level camera.
+
+    depth: list of (H, W) z-depth images (0 = no hit). Pixels of the bottom `rows` fraction and
+    the middle `cols` fraction are back-projected; the drop below the camera of each is
+    depth * (v - cy) / f. The floor is the most common drop (furniture tops drop less, and are
+    seen in fewer pixels). Returns None if no pixel qualifies.
+    """
+    drops = []
+    for d in depth:
+        h, w = d.shape
+        f = (w / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+        v0, c0, c1 = int(h * (1.0 - rows)), int(w * (0.5 - cols / 2)), int(w * (0.5 + cols / 2))
+        z = d[v0:, c0:c1]
+        v = np.arange(v0, h, dtype=np.float64)[:, None] + 0.5 - h / 2.0
+        drop = (z * v / f)[z > 0]
+        drops.append(drop[(drop > lo) & (drop < hi)])
+    drops = np.concatenate(drops) if drops else np.zeros(0)
+    if drops.size == 0:
+        return None
+    hist, edges = np.histogram(drops, bins=np.arange(lo, hi + bin_size, bin_size))
+    k = int(np.argmax(hist))
+    near = drops[(drops >= edges[k] - bin_size) & (drops < edges[k + 1] + bin_size)]
+    return float(np.median(near))
+
+
 def obstacle_mask_from_navigable(nav, radius_px):
     """Approximate the real obstacles of one floor from its navmesh top-down view.
 
@@ -125,6 +187,7 @@ class OdomTracker:
 
     def reset(self, pos_ros, yaw_ros):
         self.p0 = np.asarray(pos_ros[:2], dtype=np.float64)
+        self.z0 = float(pos_ros[2])
         self.yaw0 = yaw_ros
         self.prev = (0.0, 0.0, 0.0)
 
@@ -140,7 +203,7 @@ class OdomTracker:
             vx = ((x - px) * math.cos(pyaw) + (y - py) * math.sin(pyaw)) / dt
             wz = wrap_angle(yaw - pyaw) / dt
         self.prev = (x, y, yaw)
-        return x, y, yaw, vx, wz
+        return x, y, float(pos_ros[2]) - self.z0, yaw, vx, wz
 
 
 # ----------------------------------------------------------------------------
@@ -158,6 +221,13 @@ class HabitatRobot:
 
         sim_cfg = habitat_sim.SimulatorConfiguration()
         sim_cfg.scene_id = args.scene
+        if args.semantic and not args.dataset_config:
+            # the semantic mesh and the category list are attached to the scene by the dataset
+            # config (the scene coordinates are the same with and without it)
+            args.dataset_config = find_dataset_config(args.scene)
+            if not args.dataset_config:
+                sys.exit('[habitat_server] --semantic needs --dataset-config '
+                         '(hm3d_annotated_basis.scene_dataset_config.json)')
         if args.dataset_config:
             sim_cfg.scene_dataset_config_file = args.dataset_config
         sim_cfg.enable_physics = False
@@ -183,9 +253,30 @@ class HabitatRobot:
             spec.sensor_type = habitat_sim.SensorType.COLOR
             spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
             spec.resolution = [args.rgb_height, args.rgb_width]
-            spec.hfov = mn.Deg(90.0)
+            spec.hfov = mn.Deg(args.camera_hfov)
             spec.position = [0.0, args.camera_height, 0.0]
             specs.append(spec)
+            if args.depth:
+                # same pose, resolution and hfov as the RGB camera -> registered RGB-D
+                spec = habitat_sim.CameraSensorSpec()
+                spec.uuid = 'depth'
+                spec.sensor_type = habitat_sim.SensorType.DEPTH
+                spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
+                spec.resolution = [args.rgb_height, args.rgb_width]
+                spec.hfov = mn.Deg(args.camera_hfov)
+                spec.position = [0.0, args.camera_height, 0.0]
+                specs.append(spec)
+            if args.semantic:
+                # registered with the RGB camera; habitat-sim 0.3.0 renders HM3D semantics only
+                # when a colour sensor exists as well (all zeros without one)
+                spec = habitat_sim.CameraSensorSpec()
+                spec.uuid = 'semantic'
+                spec.sensor_type = habitat_sim.SensorType.SEMANTIC
+                spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
+                spec.resolution = [args.rgb_height, args.rgb_width]
+                spec.hfov = mn.Deg(args.camera_hfov)
+                spec.position = [0.0, args.camera_height, 0.0]
+                specs.append(spec)
 
         agent_cfg = habitat_sim.agent.AgentConfiguration()
         agent_cfg.height = args.agent_height
@@ -194,8 +285,10 @@ class HabitatRobot:
 
         self.sim = habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent_cfg]))
         self.agent = self.sim.get_agent(0)
+        self.camera_pitch = 0.0
         self.node = self.agent.scene_node
 
+        self.sem_lut = self._semantic_lut() if args.semantic and args.rgb_width > 0 else None
         self._setup_navmesh()
         self.start_pos, self.start_yaw_hab = self._pick_start()
         self._build_floor_obstacles()
@@ -208,9 +301,57 @@ class HabitatRobot:
 
         self.lut = build_scan_lut(args.num_beams, args.depth_width)
         self.odom = OdomTracker()
+        self.camera_height_base = args.camera_height   # RGB-D camera height above the agent base
+        if args.camera_height_ref == 'floor':
+            self._place_camera_above_floor()
         self.reset()
 
     # -- setup ---------------------------------------------------------------
+    def _semantic_lut(self):
+        """Instance id -> class code (SEMANTIC_CLASSES) from the scene's semantic annotation."""
+        objs = [o for o in self.sim.semantic_scene.objects if o is not None]
+        if not objs:
+            sys.exit('[habitat_server] --semantic: the scene has no semantic annotation')
+        lut = np.zeros(max(o.semantic_id for o in objs) + 1, dtype=np.uint8)
+        count = {}
+        for o in objs:
+            c = semantic_class(o.category.name())
+            lut[o.semantic_id] = c
+            count[c] = count.get(c, 0) + 1
+        names = {v: k for k, v in SEMANTIC_CLASSES.items()}
+        print('[habitat_server] semantic classes (ground truth): ' + ', '.join(
+            f'{names[c]} {count.get(c, 0)} objects' for c in sorted(names) if c))
+        return lut
+
+    def _place_camera_above_floor(self):
+        """Put the RGB-D camera camera_height above the floor, not above the agent base.
+
+        The agent stands on the navmesh, which Recast builds on a coarse vertical grid: in
+        HM3D 00800 it lies ~0.16 m above the mesh floor, so a camera mounted 0.88 m above the
+        base was ~1.05 m above the floor the depth camera sees. The offset is measured once at
+        the start pose with the depth camera (four headings) and the camera lowered by it.
+        """
+        a, mn = self.args, self.mn
+        if not (a.depth and a.rgb_width > 0):
+            print('[habitat_server] camera height: no depth camera, kept above the agent base')
+            return
+        imgs = []
+        for k in range(4):
+            self._set_pose(self.start_pos, self.start_yaw_hab + k * math.pi / 2.0)
+            imgs.append(np.asarray(self.sim.get_sensor_observations()['depth'], dtype=np.float64))
+        drop = floor_drop(imgs, a.camera_hfov)
+        if drop is None:
+            print('[habitat_server] camera height: floor not seen at the start, kept above the agent base')
+            return
+        offset = drop - self.camera_height_base          # floor below the agent base
+        h = a.camera_height - offset
+        for uuid in ('rgb', 'depth', 'semantic'):
+            if uuid in self.agent._sensors:
+                self.agent._sensors[uuid].node.translation = mn.Vector3(0.0, h, 0.0)
+        self.camera_height_base = h
+        print(f'[habitat_server] floor {offset:.3f} m below the agent base (navmesh): RGB-D camera '
+              f'at {h:.3f} m above the base = {a.camera_height:.2f} m above the floor')
+
     def _setup_navmesh(self):
         pf = self.sim.pathfinder
         if self.args.recompute_navmesh or not pf.is_loaded:
@@ -351,22 +492,43 @@ class HabitatRobot:
             virt = navmesh_ray_ranges(self.obst, self.obst_x0, self.obst_z0, self.obst_mpp,
                                       pos[0], pos[2], yaw_ros, len(ranges), self.args.max_range)
             ranges = np.minimum(ranges, virt)
-        rgb = b''
+        rgb = depth = b''
         if 'rgb' in obs:
             rgb = np.ascontiguousarray(obs['rgb'][:, :, :3]).tobytes()
-        return ranges, rgb
+        if 'depth' in obs:
+            depth = np.ascontiguousarray(obs['depth'], dtype=np.float32).tobytes()
+        sem = b''
+        if self.sem_lut is not None and 'semantic' in obs:
+            ids = np.minimum(np.asarray(obs['semantic'], dtype=np.int64), len(self.sem_lut) - 1)
+            sem = np.ascontiguousarray(self.sem_lut[ids]).tobytes()
+        return ranges, rgb, depth, sem
+
+    def set_pitch(self, pitch):
+        """Camera pitch [rad], negative = down (TravExplorer's look_down action), applied to the
+        registered RGB / depth / semantic cameras; the scan cameras stay level."""
+        pitch = float(np.clip(pitch, -math.pi / 2.0, math.pi / 2.0))
+        if abs(pitch - self.camera_pitch) < 1e-6:
+            return
+        mn = self.mn
+        q = mn.Quaternion.rotation(mn.Rad(pitch), mn.Vector3.x_axis())   # about Habitat +x: + = up
+        for uuid in ('rgb', 'depth', 'semantic'):
+            if uuid in self.agent._sensors:
+                self.agent._sensors[uuid].node.rotation = q
+        self.camera_pitch = pitch
 
     def header(self, dt, collided=False):
         pos, pos_ros, yaw_ros = self._pose_ros()
-        x, y, yaw, vx, wz = self.odom.update(pos_ros, yaw_ros, dt)
+        x, y, z, yaw, vx, wz = self.odom.update(pos_ros, yaw_ros, dt)
         fwd = self.node.rotation.transform_vector(self.mn.Vector3(0.0, 0.0, -1.0))
         return {
             'sim_time': self.sim_time,
             'step': self.steps,
-            'odom': {'x': x, 'y': y, 'yaw': yaw, 'vx': vx, 'wz': wz},
+            # z: agent height on the navmesh relative to the start (stairs, other floors)
+            'odom': {'x': x, 'y': y, 'z': z, 'yaw': yaw, 'vx': vx, 'wz': wz},
             'gt_habitat': {'x': float(pos[0]), 'y': float(pos[1]), 'z': float(pos[2]),
                            'yaw': math.atan2(-fwd.x, -fwd.z)},
             'collided': collided,
+            'camera_pitch': self.camera_pitch,   # rad, negative = down (ROS: + about base_link y)
             'collisions': self.collisions,
             'path_length': self.path_length,
         }
@@ -378,10 +540,14 @@ class HabitatRobot:
             'num_beams': a.num_beams,
             'max_range': a.max_range,
             'laser_height': a.laser_height,
-            'camera_height': a.camera_height,
+            'camera_height': self.camera_height_base,    # above the agent base (base_link)
             'rgb_width': a.rgb_width,
             'rgb_height': a.rgb_height,
+            'camera_hfov': a.camera_hfov,
+            'depth': bool(a.depth and a.rgb_width > 0),
             'agent_radius': a.agent_radius,
+            'semantic': self.sem_lut is not None,
+            'semantic_classes': SEMANTIC_CLASSES,
         }
 
 
@@ -406,17 +572,30 @@ def parse_args(argv=None):
                    help='min distance from obstacles for a random start pose [m]')
     p.add_argument('--agent-height', type=float, default=0.6)
     p.add_argument('--max-climb', type=float, default=0.1,
-                   help='max step height on the navmesh [m]; 0.1 keeps stairs out (single floor)')
+                   help='max step height on the navmesh [m]; 0.1 keeps stairs out (single floor), '
+                        '0.2 (Habitat default) connects the floors of 00800 over its stairs')
     p.add_argument('--no-navmesh-obstacles', dest='navmesh_obstacles', action='store_false',
                    help='do not add navmesh-derived low obstacles/stairs to the scan')
     p.add_argument('--no-recompute-navmesh', dest='recompute_navmesh', action='store_false')
     p.add_argument('--laser-height', type=float, default=0.4, help='scan plane height above the floor [m]')
-    p.add_argument('--camera-height', type=float, default=0.5)
+    # RGB-D camera as in TravExplorer / Habitat ObjectNav 2023: 640x480, 0.88 m, hfov 79 deg
+    p.add_argument('--camera-height', type=float, default=0.88,
+                   help='RGB-D camera height [m] above the floor (see --camera-height-ref)')
+    p.add_argument('--camera-height-ref', choices=['floor', 'base'], default='floor',
+                   help='floor: measured floor under the start pose (the agent base sits on the '
+                        'navmesh, above the mesh floor); base: above the agent base')
+    p.add_argument('--camera-hfov', type=float, default=79.0)
     p.add_argument('--num-beams', type=int, default=720)
     p.add_argument('--depth-width', type=int, default=256)
     p.add_argument('--max-range', type=float, default=10.0)
-    p.add_argument('--rgb-width', type=int, default=320, help='0 disables the RGB camera')
-    p.add_argument('--rgb-height', type=int, default=240)
+    p.add_argument('--rgb-width', type=int, default=640, help='0 disables the RGB camera')
+    p.add_argument('--rgb-height', type=int, default=480)
+    p.add_argument('--no-depth', dest='depth', action='store_false',
+                   help='no depth image next to the RGB camera (needed for the voxel map)')
+    p.add_argument('--semantic', action='store_true',
+                   help='ground-truth semantic class image next to the RGB camera (HM3D annotation; '
+                        'finds hm3d_annotated_*scene_dataset_config.json above the scene if '
+                        '--dataset-config is not given)')
     p.add_argument('--max-lin-vel', type=float, default=1.0)
     p.add_argument('--max-ang-vel', type=float, default=2.0)
     return p.parse_args(argv)
@@ -450,21 +629,23 @@ def main():
         op = req.get('op', 'step')
         try:
             if op == 'info':
-                sock.send_multipart([json.dumps(robot.info()).encode(), b'', b''])
+                sock.send_multipart([json.dumps(robot.info()).encode(), b'', b'', b'', b''])
                 continue
             if op == 'reset':
                 robot.reset()
                 collided, dt = False, 0.0
             else:
                 dt = float(req.get('dt', 0.05))
+                if 'pitch' in req:
+                    robot.set_pitch(float(req['pitch']))
                 collided = robot.step(float(req.get('vx', 0.0)), float(req.get('wz', 0.0)), dt)
-            ranges, rgb = robot.observe()
+            ranges, rgb, depth, sem = robot.observe()
             finite = ranges[np.isfinite(ranges)]
             min_scan = float(finite.min()) if finite.size else float('inf')
             hdr = robot.header(dt, collided)
-            sock.send_multipart([json.dumps(hdr).encode(), ranges.tobytes(), rgb])
+            sock.send_multipart([json.dumps(hdr).encode(), ranges.tobytes(), rgb, depth, sem])
         except Exception as e:  # always answer, or the REQ socket on the ROS side locks up
-            sock.send_multipart([json.dumps({'error': repr(e)}).encode(), b'', b''])
+            sock.send_multipart([json.dumps({'error': repr(e)}).encode(), b'', b'', b'', b''])
             print(f'[habitat_server] error: {e!r}')
             continue
 

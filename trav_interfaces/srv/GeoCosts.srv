@@ -1,0 +1,8 @@
+# J_geo (TravExplorer eq. 15-16) between points on the support graph of the current floor
+# (voxel_mapper_node, trav3d.FloorGraph). Points are snapped to the nearest M_trav voxel.
+geometry_msgs/Point[] sources
+geometry_msgs/Point[] targets
+---
+# row-major [len(sources) x len(targets)]; inf where there is no path or no M_trav voxel near
+float64[] costs
+bool ok          # false: no map / graph yet

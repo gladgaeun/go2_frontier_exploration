@@ -47,14 +47,22 @@ ros2 launch habitat_bridge hm3d_single_floor_exploration.launch.py
 Useful launch arguments: `explore:=false` (sim + mapping + Nav2 only, send goals from RViz),
 `rviz:=false`, `explore_delay:=20.0`, `region_size_thresh:=8`,
 `mapper:=slam_toolbox` (run SLAM like on the Go2; default `gt` builds /map from the exact
-simulator pose, which avoids two publishers of map->odom).
+simulator pose, which avoids two publishers of map->odom),
+`voxel_map:=false` (no 3D voxel map), `frontier_map:=voxel` (frontiers from the voxel map
+instead of /map, see below).
+
+## 3D voxel map
+
+The voxel map (occupancy + traversability from the RGB-D camera, TravExplorer) lives in the
+[`trav_exploration`](../trav_exploration/README.md) package; this launch file starts its
+`voxel_mapper_node` (`voxel_map:=false` to disable).
 
 ## Files
 
 | file | role |
 |---|---|
-| `scripts/habitat_server.py` | conda side: HM3D scene, virtual 2D LiDAR from 4 depth cameras, RGB, /cmd_vel with navmesh collision |
-| `habitat_bridge/bridge_node.py` | ROS side: /clock /odom /tf /scan /camera/image_raw /map, /cmd_vel to the server |
+| `scripts/habitat_server.py` | conda side: HM3D scene, virtual 2D LiDAR from 4 depth cameras, RGB-D camera, /cmd_vel with navmesh collision |
+| `habitat_bridge/bridge_node.py` | ROS side: /clock /odom /tf /scan /camera/{image_raw,depth/image_raw,camera_info} /map, /cmd_vel to the server |
 | `habitat_bridge/gt_mapper.py` | occupancy grid from the exact simulator pose |
 | `launch/hm3d_single_floor_exploration.launch.py` | bridge + Nav2 + frontier detector + explorer + RViz |
 | `config/nav2_hm3d_single_floor.yaml` | Nav2 parameters |
@@ -77,10 +85,19 @@ gaps in walls. Exploration ends with `Exploration complete!` when no new frontie
 | `--start-clearance` | 0.6 | random start pose keeps this distance from obstacles |
 | `--laser-height` | 0.4 | height of the virtual 2D LiDAR plane |
 | `--max-range` | 10.0 | keep equal to slam_toolbox `max_laser_range` |
-| `--rgb-width 0` | 320 | disables the RGB camera |
+| `--rgb-width`, `--rgb-height` | 640, 480 | RGB-D camera; `--rgb-width 0` disables it (and the depth image) |
+| `--camera-height`, `--camera-hfov` | 0.88, 79 | RGB-D camera as in TravExplorer (Habitat ObjectNav 2023) |
+| `--camera-height-ref` | floor | `floor`: camera height above the floor measured at the start (the agent base sits on the navmesh, ~0.16 m above the mesh floor in 00800); `base`: above the agent base |
+| `--no-depth` | (on) | no depth image next to the RGB camera (the voxel map needs it) |
+| `--semantic` | off | ground-truth class image registered with the RGB camera on `camera/semantic/image_raw` (mono8: 0 other, 1 floor, 2 rug/mat, 3 stairs) from the HM3D semantic annotation; finds `hm3d_annotated_*scene_dataset_config.json` above the scene unless `--dataset-config` is given (scene coordinates are the same with it) |
 | `--seed` | 0 | random start pose selection |
-| `--max-climb` | 0.1 | navmesh step height; 0.1 keeps stairs out (single-floor exploration) |
+| `--max-climb` | 0.1 | navmesh step height; 0.1 keeps stairs out (single-floor exploration), 0.2 (Habitat default) connects the floors of 00800 (stair climb) |
 | `--no-navmesh-obstacles` | (on) | by default low obstacles/stairs/drop-offs from the navmesh are added to /scan |
+
+Camera pitch: `camera/pitch_cmd` (std_msgs/Float64, rad, + = down) tilts the RGB / depth / semantic
+cameras (the scan cameras stay level), like the look_down action of TravExplorer's simulation;
+`base_link -> camera_link` is published on /tf every step with the pitch the server applied,
+stamped like the images (it used to be a static transform).
 
 ## Quick checks
 

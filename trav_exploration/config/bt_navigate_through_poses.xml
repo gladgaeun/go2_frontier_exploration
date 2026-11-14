@@ -1,0 +1,10 @@
+<!--
+  Not used by the exploration (it sends single goals). bt_navigator loads this tree at start-up,
+  and Nav2's default one needs compute_path_through_poses and the global costmap of the
+  planner_server, which is not started (see bt_navigate_to_pose.xml).
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Wait wait_duration="1"/>
+  </BehaviorTree>
+</root>

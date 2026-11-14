@@ -29,6 +29,13 @@ go2_frontier_exploration/
 │   ├── habitat_bridge/gt_mapper.py           # occupancy grid from the exact sim pose
 │   ├── launch/hm3d_single_floor_exploration.launch.py
 │   └── config/                               # Nav2, slam_toolbox, RViz for HM3D
+├── trav_exploration/                 # TravExplorer reimplementation: multi-floor 3D exploration in HM3D
+│   ├── trav_exploration/voxel_mapper.py      # occupancy, M_g (2-D ray casting), M_s, inflation, M_trav
+│   ├── trav_exploration/voxel_mapper_node.py # voxel map, g/s modes, 3-D path planning, stair climb
+│   ├── trav_exploration/trav3d.py            # support graph of the map (paths, J_geo, climb)
+│   ├── trav_exploration/frontier_goal_node.py # floor-by-floor frontier tour (ATSP), stairs
+│   └── launch/hm3d_trav_exploration.launch.py
+├── trav_interfaces/                  # GeoCosts.srv (J_geo on the support graph)
 ├── learned_frontier_detector/        # YOLOv5-based frontier detector (optional)
 └── docs/images/                      # result images used in the READMEs
 ```
