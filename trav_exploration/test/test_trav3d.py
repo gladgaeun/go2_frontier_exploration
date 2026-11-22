@@ -345,8 +345,14 @@ def _unlabel_steps(m, steps):
     m.reinflate_all()
 
 
+def _seen_free(m):
+    """Everything not occupied was seen free (the camera looked through the stairwell)."""
+    m.logodds[m.logodds == 0.0] = m.l_min
+
+
 def test_geometric_treads_bridge_unlabelled_steps():
     m, k, top = _stairs()
+    _seen_free(m)
     m.stair_seen |= m.stairs
     _unlabel_steps(m, (2, 3))
     start = (0.75, 0.0, _z(m, k + 4))                       # on step 0
@@ -365,6 +371,7 @@ def test_geometric_treads_bridge_unlabelled_steps():
 
 def test_geometric_treads_leave_furniture_away_from_stairs():
     m, k, top = _stairs()
+    _seen_free(m)
     m.stair_seen |= m.stairs
     xs = m.origin_xy + (np.arange(m.nx) + 0.5) * m.res
     ys = m.origin_xy + (np.arange(m.ny) + 0.5) * m.res
@@ -374,6 +381,29 @@ def test_geometric_treads_leave_furniture_away_from_stairs():
     add, _ = m.geometric_treads(-1.0, 0.0, _z(m, k), radius=2.0)
     ii, _, _ = np.unravel_index(add, m.logodds.shape)
     assert not (m.origin_xy + (ii + 0.5) * m.res < -1.3).any()
+
+
+def test_geometric_treads_leave_the_seen_top_of_a_wall():
+    # the side wall of the stairwell seen only up to some height along the flight (unknown above,
+    # free in front of it): its observed upper edge is no tread, whatever its height steps
+    m, k, top = _stairs()
+    xs = m.origin_xy + (np.arange(m.nx) + 0.5) * m.res
+    ys = m.origin_xy + (np.arange(m.ny) + 0.5) * m.res
+    wall = np.abs(ys) >= 0.6
+    m.logodds[np.ix_(xs > 0.4, wall, range(k, m.nz))] = 0.0       # wall unseen ...
+    for n in range(6):                                            # ... except up to 0.4 m over each step
+        sel = (xs >= 0.5 + 0.3 * n) & (xs < 0.8 + 0.3 * n)
+        kk = k + 4 * (n + 1)
+        m.logodds[np.ix_(sel, np.abs(ys - 0.625) < 0.01, range(k, kk + 8))] = m.l_max
+    inside = np.abs(ys) < 0.6                                     # the stairwell itself seen free
+    air = np.zeros(m.logodds.shape, dtype=bool)
+    air[:, inside, :] = True
+    m.logodds[air & (m.logodds == 0.0)] = m.l_min
+    m.stair_seen |= m.stairs
+    m.reinflate_all()
+    add, steps = m.geometric_treads(0.75, 0.0, _z(m, k + 4), radius=2.5, up=2.0)
+    _, jj, _ = np.unravel_index(add, m.logodds.shape)
+    assert not (np.abs(ys[jj]) >= 0.6).any()                      # nothing on the wall
 
 
 def test_cluster_costs_min_over_voxels_and_none_behind_a_wall():
@@ -395,6 +425,7 @@ def test_cluster_costs_min_over_voxels_and_none_behind_a_wall():
 
 def test_geometric_steps_leave_the_floor_beyond_unlabelled():
     m, k, top = _stairs()
+    _seen_free(m)
     m.stair_seen |= m.stairs
     xs = m.origin_xy + (np.arange(m.nx) + 0.5) * m.res
     far = xs >= 0.5 + 0.3 * 2                               # steps 2.. and the landing unlabelled
