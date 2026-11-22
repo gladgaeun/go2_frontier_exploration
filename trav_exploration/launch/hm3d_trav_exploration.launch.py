@@ -1,8 +1,9 @@
 # Frontier exploration on the 3D voxel traversability map in Habitat-sim (HM3D, single floor):
 #   habitat_bridge -> voxel_mapper_node (M_trav, 3D frontiers) -> frontier_goal_node
-#   -> frontier_exploration_node (2D exploration loop, unchanged) -> Nav2 (controller on
+#   -> explore_executor_node (goal after goal to Nav2; no 2-D (x, y) blacklist) -> Nav2 (controller on
 #      voxel_map/trav_grid; global path from voxel_mapper_node's 3-D support graph planner)
-#   -> collision_guard_node (cmd_vel -> cmd_vel_safe: stops before contact, marks blocked voxels)
+#   -> collision_guard_node (cmd_vel -> cmd_vel_safe: 3-D stair paths; guard_mode:=full also stops
+#      before contact and marks blocked voxels)
 #
 # Start habitat_server.py (conda env) first, then:
 #   ros2 launch trav_exploration hm3d_trav_exploration.launch.py
@@ -39,14 +40,49 @@ def generate_launch_description():
                               description="frontier boundary test, see frontier3d.py ('trav' = literal)"),
         DeclareLaunchArgument('goal_order', default_value='atsp', choices=['atsp', 'score'],
                               description="frontier order: 'atsp' = TravExplorer open tour, 'score' = 2D ranking"),
-        DeclareLaunchArgument('inflation_radius', default_value='0.22',
-                              description='O_inf radius (voxel_mapper robot_radius); real body 0.25 m'),
+        # hard constraint (Sec. IV-B): O_inf below the body radius, so a gap the body can pass stays
+        # open; how narrow it is goes into the soft ESDF cost (eq. 15-16, d_safe), and a gap the
+        # controller then cannot follow is closed by the execute-review (collision_guard).
+        # = the body (0.18 m, Habitat ObjectNav agent), as M_trav of the paper removes the obstacles
+        # inflated by the robot (Sec. VI-B). Earlier 0.15, which floored to 2 cells (0.15 / 0.05 =
+        # 2.9999...), i.e. 0.10 m in effect: paths ran 0.08 m into the walls on the stairs. 0.16 (3
+        # cells) once closed half the treads of the narrow stairs of 00803 (71 % -> 50 %
+        # traversable): to be checked there.
+        DeclareLaunchArgument('inflation_radius', default_value='0.18',
+                              description='O_inf radius (voxel_mapper robot_radius); body 0.18 m (Habitat ObjectNav agent)'),
         DeclareLaunchArgument('segmentation', default_value='gt', choices=['gt', 'sam3'],
                               description="semantic mode input: 'gt' = habitat_server --semantic (HM3D "
                                           "annotation), 'sam3' = semantic_seg_node + sam3_server.py"),
         DeclareLaunchArgument('sam3_address', default_value='tcp://127.0.0.1:5557'),
+        DeclareLaunchArgument('target', default_value='',
+                              description="target object query of the instance map (e.g. 'couch'; segmentation:=sam3): "
+                                          "the robot goes to it once it is reliable and stops there; '' = explore only"),
+        DeclareLaunchArgument('value_map', default_value='true',
+                              description='spatial value map with a target: itm_node + blip2_server.py (blip2 conda env)'),
+        DeclareLaunchArgument('blip2_address', default_value='tcp://127.0.0.1:5558'),
+        # instance map reliability (Sec. V-A): a cluster is a target (O_tar) once gamma >= min_confidence,
+        # n >= min_count evidence points and detected in >= min_detections frames
+        DeclareLaunchArgument('instance_min_confidence', default_value='0.5'),
+        DeclareLaunchArgument('instance_min_count', default_value='60',
+                              description='evidence points (0.1 m voxels) before an object cluster is a target'),
+        DeclareLaunchArgument('instance_min_detections', default_value='5',
+                              description='frames with a detection before a cluster is a target'),
+        DeclareLaunchArgument('debug_dump_dir', default_value='',
+                              description='save the voxel map around every climb stop here (diagnostics)'),
+        DeclareLaunchArgument('stair_landmarks', default_value='auto', choices=['auto', 'instance', 'voxel'],
+                              description="O_stair: 'instance' = stair clusters of the instance map (sam3), 'voxel' = "
+                                          "connected stair voxels (before the instance map); 'auto' = instance with sam3"),
+        DeclareLaunchArgument('map_z_below', default_value='0.25',
+                              description='voxel map depth below the start floor [m] (3.5 when starting upstairs)'),
         DeclareLaunchArgument('map_z_above', default_value='2.0',
                               description='voxel map height above the start floor [m] (4.0 for two floors)'),
+        # path_only: the guard follows the 3-D stair paths only; Nav2's commands pass through and
+        # a blocked robot is left to the execute-review of voxel_mapper / frontier_goal (the paper's
+        # way). full: also stop before contact, close narrow cells, back out on repeated failures
+        DeclareLaunchArgument('guard_mode', default_value='path_only'),
+        # true: g -> s also when stairs are seen for mode_enter_time (the paper's N_enter), not only
+        # when the planner takes the stairs; s -> g stays the N_exit sight rule
+        DeclareLaunchArgument('mode_auto_enter', default_value='false'),
         DeclareLaunchArgument('guard', default_value='true',
                               description='false = no collision guard (Nav2 drives the robot directly)'),
     ]
@@ -70,23 +106,35 @@ def generate_launch_description():
         package='trav_exploration', executable='collision_guard_node', name='collision_guard', output='screen',
         condition=IfCondition(LaunchConfiguration('guard')),
         parameters=[{'use_sim_time': True,
-                     'robot_radius': 0.25,     # real body = habitat_server --agent-radius
+                     'robot_radius': 0.18,     # body = habitat_server --agent-radius (Habitat ObjectNav)
+                     'guard_mode': LaunchConfiguration('guard_mode'),
                      'stop_distance': 0.1,
-                     'h_min': 0.15, 'h_max': 0.6}])     # = voxel_mapper
+                     'h_min': 0.15, 'h_max': 0.88}])    # = voxel_mapper
 
     # stuck detection compares odometry with the command the robot executes
     executed_cmd = PythonExpression(["'cmd_vel_safe' if '", LaunchConfiguration('guard'),
                                      "'.lower() == 'true' else 'cmd_vel'"])
+    # O_stair: the instance-map landmarks (SAM3) or the voxel map's own; voxel_mapper checks their
+    # step structure and republishes them on voxel_map/stair_landmarks_checked (frontier_goal)
+    landmark_topic = PythonExpression([
+        "'instance_map/stair_landmarks' if '", LaunchConfiguration('stair_landmarks'), "' == 'instance' or ('",
+        LaunchConfiguration('stair_landmarks'), "' == 'auto' and '", LaunchConfiguration('segmentation'),
+        "' == 'sam3') else 'voxel_map/stair_landmarks'"])
     voxel = Node(
         package='trav_exploration', executable='voxel_mapper_node', name='voxel_mapper', output='screen',
         remappings=[('cmd_vel', executed_cmd)],
         parameters=[{'use_sim_time': True,
+                     'stair_check_input': landmark_topic,
                      'resolution': 0.05,
-                     # inflation radius; like Nav2 robot_radius in the 2D stack, slightly below
-                     # habitat_server --agent-radius (0.25): with 0.25 a doorway the navmesh
-                     # agent just fits through has no traversable cell left
+                     # inflation radius = habitat_server --agent-radius (0.18, Habitat ObjectNav);
+                     # cells whose centre is within it (disk of 3.6 cells at 0.05 m). (A doorway the
+                     # navmesh agent just fits through may keep no traversable cell.)
                      'robot_radius': ParameterValue(LaunchConfiguration('inflation_radius'), value_type=float),
-                     'h_max': 0.6,             # = habitat_server --agent-height
+                     'h_max': 0.88,            # = habitat_server --agent-height (Habitat ObjectNav)
+                     # body = habitat_server --agent-radius: mark_tight closes cells closer than
+                     # this to obstacles at a guard stop; left at 0.25 it closed passages the
+                     # 0.18 m body passes and boxed the robot in (HM3D v1 00832)
+                     'body_radius': 0.18,
                      # door thresholds up to ~0.15 m are not obstacles: the navmesh (cell height
                      # 0.2 m) lets the agent over them, and a Go2 steps over them; with 0.1 the
                      # walk-in closet's threshold (0.125-0.175 m) closed its doorway on the map
@@ -95,13 +143,42 @@ def generate_launch_description():
                      # map extent above the start floor: 2 m for one floor, ~4 m to hold the
                      # upper floor of a two-storey house (stairs; habitat_server --max-climb 0.2)
                      'z_above': ParameterValue(LaunchConfiguration('map_z_above'), value_type=float),
-                     'frontier_boundary': LaunchConfiguration('frontier_boundary')}])
+                     'z_below': ParameterValue(LaunchConfiguration('map_z_below'), value_type=float),
+                     'frontier_boundary': LaunchConfiguration('frontier_boundary'),
+                     'mode_auto_enter': ParameterValue(LaunchConfiguration('mode_auto_enter'), value_type=bool),
+                     # path_only = the paper's stuck handling: v_front only, no 2-D narrow-gap closing
+                     'stuck_close_tight': ParameterValue(PythonExpression(
+                         ["'", LaunchConfiguration('guard_mode'), "' != 'path_only'"]), value_type=bool),
+                     'debug_dump_dir': LaunchConfiguration('debug_dump_dir')}])
 
-    # SAM3 segmentation (start sam3_server.py in the sam3 conda env first)
+    # SAM3 segmentation (start sam3_server.py in the sam3 conda env first): the class image of the
+    # semantic mode, and the detections of the instance map's queries (stairs, the target)
+    use_sam3 = IfCondition(PythonExpression(["'", LaunchConfiguration('segmentation'), "' == 'sam3'"]))
     segmenter = Node(
         package='trav_exploration', executable='semantic_seg_node', name='semantic_seg', output='screen',
-        condition=IfCondition(PythonExpression(["'", LaunchConfiguration('segmentation'), "' == 'sam3'"])),
-        parameters=[{'use_sim_time': True, 'zmq_address': LaunchConfiguration('sam3_address')}])
+        condition=use_sam3,
+        parameters=[{'use_sim_time': True, 'zmq_address': LaunchConfiguration('sam3_address'),
+                     'detect_queries': ['stairs'],
+                     'target': LaunchConfiguration('target')}])
+    # probabilistic instance map (Sec. V-A): O_stair (landmark branch) and O_tar (object branch)
+    instances = Node(
+        package='trav_exploration', executable='instance_map_node', name='instance_map', output='screen',
+        condition=use_sam3,
+        parameters=[{'use_sim_time': True,
+                     'landmark_queries': ['stairs'],
+                     'object_queries': LaunchConfiguration('target'),
+                     'max_range': 5.0,
+                     'min_confidence': ParameterValue(LaunchConfiguration('instance_min_confidence'), value_type=float),
+                     'min_count': ParameterValue(LaunchConfiguration('instance_min_count'), value_type=int),
+                     'min_detections': ParameterValue(LaunchConfiguration('instance_min_detections'), value_type=int)}])
+    # spatial value map (Sec. V-B): BLIP-2 image-text relevance of the target (start blip2_server.py
+    # in the blip2 conda env first); only with a target
+    itm = Node(
+        package='trav_exploration', executable='itm_node', name='itm', output='screen',
+        condition=IfCondition(PythonExpression(["'", LaunchConfiguration('target'), "' != '' and '",
+                                                LaunchConfiguration('value_map'), "'.lower() == 'true'"])),
+        parameters=[{'use_sim_time': True, 'zmq_address': LaunchConfiguration('blip2_address'),
+                     'target': LaunchConfiguration('target')}])
 
     goals = Node(
         package='trav_exploration', executable='frontier_goal_node', name='frontier_goal', output='screen',
@@ -110,6 +187,11 @@ def generate_launch_description():
                      # 2D HM3D launch (goal_clearance 0.4 on /map)
                      'goal_clearance': 0.18,
                      'goal_order': LaunchConfiguration('goal_order'),
+                     'target': LaunchConfiguration('target'),
+                     'value_weight': ParameterValue(PythonExpression(
+                         ["3.0 if '", LaunchConfiguration('value_map'), "'.lower() == 'true' else 0.0"]),
+                         value_type=float),
+                     'stair_landmark_topic': 'voxel_map/stair_landmarks_checked',
                      'inflation_radius': ParameterValue(LaunchConfiguration('inflation_radius'), value_type=float)}])     # = voxel_mapper robot_radius (d_obs in eq. 16)
 
     # Nav2 as in nav2_bringup navigation_launch.py, without the planner_server: the global path
@@ -146,23 +228,25 @@ def generate_launch_description():
     ]
     nav2 = TimerAction(period=3.0, actions=nav2_nodes)
 
-    # The 2D exploration loop, unchanged: asks frontier_pose for the rank-th best goal, checks it
-    # with the Nav2 planner, blacklists failed and reached goals. No name= (two nodes in it).
-    # A goal that failed once (Nav2 giving up in a narrow passage) stays blacklisted, and when
-    # every other frontier is unreachable the loop ends although that one is reachable. So when it
-    # ends, it is started again with an empty blacklist, up to explore_restarts times: unreachable
-    # goals then fail at path planning at once, a reachable one gets another try.
+    # The exploration loop (explore_executor_node): asks frontier_pose for the rank-th best goal,
+    # checks it with the planner, sends it to Nav2. It replaces the 2-D Go2 loop
+    # (frontier_exploration_node.py, unchanged for the 2-D stack), whose (x, y) blacklist of failed
+    # and canceled goals turned down frontiers of another floor (00891); a failure goes into the map
+    # (execute-review, eq. 17) and frontier_goal_node's dormant clusters instead. No name= (two
+    # nodes in it: the executor and its BasicNavigator).
+    # When the loop ends (no goal left), it is started again up to explore_restarts times: the
+    # dormant clusters are released by then or the map has changed.
     def explorer_node():
-        return Node(package='frontier_exploration', executable='frontier_exploration_node.py',
-                    output='screen', parameters=[{'use_sim_time': True, 'skip_reached_goals': True}])
+        return Node(package='trav_exploration', executable='explore_executor_node',
+                    output='screen', parameters=[{'use_sim_time': True}])
 
     def restart(left):
         def on_exit(event, context):
             if context.is_shutdown or event.returncode != 0 or left <= 0:
                 return None
             node = explorer_node()
-            return [LogInfo(msg=f'[explore] exploration loop ended; restarting it with an empty '
-                                f'goal blacklist ({left - 1} restarts left)'),
+            return [LogInfo(msg=f'[explore] exploration loop ended; restarting it '
+                                f'({left - 1} restarts left)'),
                     node,
                     RegisterEventHandler(OnProcessExit(target_action=node, on_exit=restart(left - 1)))]
         return on_exit
@@ -183,5 +267,5 @@ def generate_launch_description():
         parameters=[{'use_sim_time': True}],
         condition=IfCondition(LaunchConfiguration('rviz')))
 
-    return LaunchDescription(args + [bridge, bridge_unguarded, guard, voxel, segmenter, goals, nav2, explorer,
+    return LaunchDescription(args + [bridge, bridge_unguarded, guard, voxel, segmenter, instances, itm, goals, nav2, explorer,
                                      rviz])

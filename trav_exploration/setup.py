@@ -27,6 +27,9 @@ setup(
             'frontier_goal_node = trav_exploration.frontier_goal_node:main',
             'collision_guard_node = trav_exploration.collision_guard_node:main',
             'semantic_seg_node = trav_exploration.semantic_seg_node:main',
+            'instance_map_node = trav_exploration.instance_map_node:main',
+            'itm_node = trav_exploration.itm_node:main',
+            'explore_executor_node = trav_exploration.explore_executor_node:main',
         ],
     },
 )

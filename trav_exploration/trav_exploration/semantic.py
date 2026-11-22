@@ -5,18 +5,25 @@
 #   0 other, 1 floor, 2 rug (rugs, mats, carpets), 3 stairs
 # Traversable classes (M_s): floor, rug, stairs (the paper's "floor, stair, and rug").
 #
-# Mode switch with hysteresis (values not given in the paper):
-#   g -> s : stairs seen for enter_time without a frame missing them (at least min_stair_points
-#            stair pixels within enter_range of the camera), or request('s') from the planner
-#            (stair entrance landmark)
-#   s -> g : the robot farther than exit_distance from every mapped stair voxel for exit_time
-# The paper counts N_enter / N_exit consecutive frames. Here every camera frame is checked (stair
-# pixels are cheap to count; only every 0.5 s a frame goes into the map), and the counts are
-# kept as durations: the node drops frames when it is busy, so a frame count is not a fixed time.
-# exit_distance > enter_range: with stairs entering by sight and leaving by distance at the same
-# range, a robot that keeps seeing stairs from afar would switch every few seconds (and each
-# switch re-inflates the whole map). enter_range is measured from the camera, exit_distance in xy:
-# a robot more than exit_distance away cannot see stair pixels within enter_range.
+# Mode switch. Mode s is the mode of the stair transition (Sec. IV-A / VI-A): the planner switches
+# to it when it decides to take the stairs (request('s'), voxel_mapper_node._start_climb) and back
+# to g when the robot is off the stairs on a floor (request('g'), _end_climb). Recording where
+# stairs are while the robot explores a floor in mode g is the instance map's job (O_stair) and the
+# voxel map's stair voxels, not the mode's.
+#   g -> s : request('s') only. With auto_enter (the earlier behaviour, off by default) also stairs
+#            seen for enter_time without a frame missing them (at least min_stair_points stair
+#            pixels within enter_range of the camera): the robot was in mode s for 21 % of the
+#            time while exploring floors near stairs (v1 val, 140 episodes), not climbing.
+#   s -> g : exit_rule='distance' (default, the paper, Sec. IV-A: "switches back to geometric mode
+#            only after the robot remains sufficiently far from the stair region for N_exit
+#            consecutive frames"): the robot farther than exit_distance (xy) from every mapped
+#            stair voxel near its height for exit_frames consecutive class frames; never during a
+#            climb (voxel_mapper_node ignores the switch while climbing and ends the climb by the
+#            same rule). The paper gives no values: exit_distance 1.0 m, exit_frames 5 (class
+#            frames at the segmentation rate, SAM3 ~2.8 Hz: ~1.8 s).
+#            exit_rule='sight' (the earlier rule): no stairs in view for exit_frames consecutive
+#            class frames (fewer than min_stair_points stair pixels within enter_range).
+# N_enter (auto_enter) is kept as a duration (enter_time): every camera frame is checked.
 
 # Pure python, no ROS imports.
 
@@ -34,9 +41,14 @@ def split_classes(classes):
 
 class ModeSwitch:
 
-    def __init__(self, enter_time=0.5, exit_time=1.0, min_stair_points=50, enter_range=4.0,
-                 exit_distance=4.5, mode='g'):
-        self.enter_time, self.exit_time = float(enter_time), float(exit_time)
+    def __init__(self, enter_time=0.5, min_stair_points=50, enter_range=4.0,
+                 exit_distance=1.0, mode='g', auto_enter=False, exit_rule='distance', exit_frames=5):
+        self.auto_enter = bool(auto_enter)
+        if exit_rule not in ('sight', 'distance'):
+            raise ValueError(f"exit_rule must be 'sight' or 'distance', got {exit_rule!r}")
+        self.exit_rule, self.exit_frames = exit_rule, int(exit_frames)
+        self.n_run = 0         # consecutive exit frames (mode s): far from the stairs / none in view
+        self.enter_time = float(enter_time)
         self.min_stair_points = int(min_stair_points)
         self.enter_range, self.exit_distance = float(enter_range), float(exit_distance)
         self.mode = mode
@@ -47,15 +59,28 @@ class ModeSwitch:
         changed = mode != self.mode
         self.mode = mode
         self.since = None
+        self.n_run = 0
         return changed
 
     def update(self, t, n_near_stair_points, stair_distance):
         """One frame at time t (s): stair pixels within enter_range, xy distance of the robot to
         the nearest mapped stair voxel (inf if none). Returns True if the mode changed."""
         if self.mode == 'g':
+            if not self.auto_enter:            # mode s only when the planner takes the stairs
+                self.since = None
+                return False
             cond, hold, target = n_near_stair_points >= self.min_stair_points, self.enter_time, 's'
         else:
-            cond, hold, target = stair_distance > self.exit_distance, self.exit_time, 'g'
+            # N_exit consecutive frames: far from the stairs (distance) / no stairs in view (sight)
+            far = (stair_distance > self.exit_distance if self.exit_rule == 'distance'
+                   else n_near_stair_points < self.min_stair_points)
+            if not far:
+                self.n_run = 0
+                return False
+            self.n_run += 1
+            if self.n_run >= self.exit_frames:
+                return self.request('g')
+            return False
         if not cond:
             self.since = None
             return False

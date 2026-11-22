@@ -3,8 +3,12 @@
 # voxel_map/trav_grid (support layer of the voxel map: free = M_trav, occupied = O_inf) instead
 # of the 2D /map. O_inf is already inflated by the robot radius, so the robot is a point on this
 # map, as for the TravExplorer planner on M_trav: small robot_radius, inflation only as a cost.
-# Not 0: RPP's collision check with the 0.05 m footprint keeps ~1 cell off O_inf, the margin
-# that inflation 0.22 < body 0.25 lacks (with 0.01 Habitat counted 250-380 collisions per run).
+# Not 0: RPP's collision check with the 0.05 m footprint kept ~1 cell off O_inf, the margin
+# that inflation 0.15 (0.10 in effect, 2 cells) < body 0.18 lacks (with 0.01 Habitat counted
+# 250-380 collisions per run; measured with 0.22 < 0.25, the sizes before the Habitat ObjectNav
+# agent). That check is off now (use_collision_detection false, as the paper: the plan on M_trav
+# is executed and a blocked robot is the execute-review's, eq. 17): in gaps open on M_trav it
+# stopped the robot for good ('collision ahead', recoveries spinning in place: 00847, 00849).
 #
 # Nav2 parameters for running go2_frontier_exploration in Habitat-sim (ROS 2 Humble).
 # Based on frontier_exploration/config/nav2.yaml (Go2), with these changes:
@@ -104,7 +108,7 @@ controller_server:
       transform_tolerance: 1.0
       min_approach_linear_velocity: 0.05
       approach_velocity_scaling_dist: 0.6
-      use_collision_detection: true
+      use_collision_detection: false          # see the header: execute-review instead
       max_allowed_time_to_collision_up_to_carrot: 1.0
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: true
@@ -164,14 +168,17 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.3         # cost only (O_inf already keeps 0.25 m): paths stay off O_inf
+        inflation_radius: 0.3         # cost only (O_inf already keeps the body off): paths stay off O_inf
       always_send_full_costmap: True
 
 global_costmap:
   global_costmap:
     ros__parameters:
       use_sim_time: True
-      update_frequency: 1.0
+      # 5 Hz (was 1): a block marked by a stuck event (trav_grid, voxel_map/blocked, published at
+      # once) is in the planner's map within 0.2 s, before the explorer checks its next goal
+      # (~0.5 s after the cancel); at 1 Hz the old map could still show the narrow way open
+      update_frequency: 5.0
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
@@ -199,7 +206,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.3         # cost only (O_inf already keeps 0.25 m): paths stay off O_inf
+        inflation_radius: 0.3         # cost only (O_inf already keeps the body off): paths stay off O_inf
       always_send_full_costmap: True
 
 planner_server:
@@ -209,7 +216,10 @@ planner_server:
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
-      tolerance: 0.5
+      # a goal it cannot reach is not planned to the nearest point within 0.5 m (that point lay
+      # on this side of the wall a frontier goal was behind, and the explorer took the goal);
+      # frontier and target goals are snapped onto free cells, so they need no tolerance
+      tolerance: 0.15
       use_astar: false
       allow_unknown: false            # plan on M_trav only (TravExplorer), not through unknown holes
 
