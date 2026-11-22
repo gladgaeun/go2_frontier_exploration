@@ -437,7 +437,7 @@ class VoxelMapper:
         return int(keep.sum())
 
     def geometric_treads(self, x, y, z_r, radius=2.0, up=1.2, down=0.3, max_step=0.25, stair_near=0.5,
-                         hint=None, step_near=0.4):
+                         hint=None, step_near=0.4, free_above=2):
         """Treads the segmentation missed, by geometry (mode s, while climbing).
 
         Where a staircase turns, SAM3 often leaves the treads and risers of the turn unlabelled:
@@ -446,7 +446,7 @@ class VoxelMapper:
         collision guard) held the robot (00803: 13 of 15 dev climb stops had 90-310 such voxels
         within 0.6 m). A geometric fallback, after the paper's step-height reasoning: an occupied
         voxel is a tread when it is a top surface (the voxel above is not occupied) with n_h
-        layers of headroom, and it is reached from the robot's support over surfaces (T or such
+        layers of headroom, the free_above voxels right above it seen free, and it is reached from the robot's support over surfaces (T or such
         treads) at most max_step apart in height and one cell apart in xy. Only within `radius` of
         the robot, from `down` below z_r to `up` above, and within stair_near (xy, +-max_step in
         z) of stair-labelled voxels, or within hint = (x, y, r) of the stairs the planner asked to
@@ -478,6 +478,17 @@ class VoxelMapper:
         for d in range(1, min(hh, nz - 1) + 1):
             head[:, :, :nz - d] |= occ[:, :, d:]
         cand = top & ~head
+        # the free_above voxels right above a tread must have been seen free (log-odds < 0), not
+        # just "not occupied": the camera sees a tread through the air above it, but the upper
+        # edge of the part of a wall it has seen has unknown space above. Without this, the
+        # observed top of the stairwell wall, rising with the robot along the flight, passed as a
+        # chain of treads and the wall became traversable (00800 0028: 374 M_trav voxels on the
+        # wall, all of them geometric treads)
+        if free_above > 0:
+            seen_free = self.logodds[box] < 0.0
+            for d in range(1, min(free_above, nz - 1) + 1):
+                cand[:, :, :nz - d] &= seen_free[:, :, d:]
+                cand[:, :, nz - d:] = False
         cand[:, :, k_top - k_lo + 1:] = False
 
         def spread(a, rad_xy, rad_z):
