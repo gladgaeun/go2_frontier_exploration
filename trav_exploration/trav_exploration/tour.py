@@ -97,13 +97,16 @@ def geo_costs(graph, sources, targets):
     return out
 
 
-def cost_matrix(J_geo, lambda_g=0.0):
+def cost_matrix(J_geo, lambda_g=0.0, node_cost=None):
     """Eq. 11-13 for X_A = {x_r} U F_g. J_geo is [1 + n, n]: row 0 from the robot, row 1 + i from
-    candidate i. Returns the (1 + n) x (1 + n) matrix, node 0 = robot."""
+    candidate i. node_cost (n,): a further cost of entering candidate j, added like J_front(v_j)
+    (the value-map term lambda_v (1 - u_j), Sec. V-B). Returns the (1 + n) x (1 + n) matrix,
+    node 0 = robot."""
     n = J_geo.shape[1]
+    extra = lambda_g + (np.zeros(n) if node_cost is None else np.asarray(node_cost, dtype=np.float64))
     C = np.zeros((n + 1, n + 1))
-    C[0, 1:] = J_geo[0] + lambda_g                 # c_rA (eq. 13)
-    C[1:, 1:] = J_geo[1:] + lambda_g               # C_AA (eq. 12)
+    C[0, 1:] = J_geo[0] + extra                    # c_rA (eq. 13)
+    C[1:, 1:] = J_geo[1:] + extra[None, :]         # C_AA (eq. 12)
     np.fill_diagonal(C, 0.0)                       # c_rr = 0, C_AA(i, i) = 0
     C[1:, 0] = 0.0                                 # c_Ar = 0: open tour
     return C

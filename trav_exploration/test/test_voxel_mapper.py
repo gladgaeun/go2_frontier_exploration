@@ -281,3 +281,159 @@ def test_threshold_below_h_min_is_passable():
     for x in (0.75, 1.0, 1.25):                               # before, on and behind it
         assert m.traversable()[cell(m, x, -1.5)]
     assert not m.traversable()[cell(m, -1.75, 1.25)]          # the 0.3 m box still blocks
+
+
+def test_traversable_at_matches_traversable_in_both_modes():
+    m = build()
+    full = m.traversable().reshape(-1)
+    idx = np.concatenate([np.flatnonzero(full)[:2000], np.random.default_rng(0).integers(0, full.size, 2000)])
+    assert np.array_equal(m.traversable_at(idx), full[idx])
+    m.trav_s[:, :, m.layer(0.0) + 3] = True                # something only in M_s
+    m.set_mode('s')
+    full = m.traversable().reshape(-1)
+    idx = np.concatenate([np.flatnonzero(full)[-2000:], idx])
+    assert np.array_equal(m.traversable_at(idx), full[idx])
+
+
+def test_semantic_only_is_stairs_outside_m_g():
+    m = VoxelMapper(resolution=0.1, size_xy=4.0, z_below=0.5, z_above=2.0, mode='s')
+    k = m.layer(0.0)
+    m.trav_s[10:20, 10:20, k] = True                       # floor seen in mode s
+    m.trav_s[20:25, 10:20, k + 2] = True                   # a step
+    m.stairs[20:25, 10:20, k + 2] = True
+    flat = lambda i, j, kk: (i * m.ny + j) * m.nz + kk
+    assert not m.semantic_only_at([flat(12, 12, k)])[0]    # floor: joins M_g at s -> g
+    assert m.semantic_only_at([flat(22, 12, k + 2)])[0]    # the step: only through M_s
+    m.trav_g[22, 12, k + 2] = True
+    assert not m.semantic_only_at([flat(22, 12, k + 2)])[0]
+
+
+def test_virtual_ground_counts_points_below_the_plane_near_the_robot():
+    from trav_exploration.voxel_mapper import VirtualGround
+    vg = VirtualGround(depth=0.3, radius=2.0, n_down=2, hold=3.0)
+    pts = [[1.0, 0.0, -0.1],             # floor noise / one step down: above Pi_vg
+           [1.0, 0.0, -0.5], [1.5, 0.0, -1.0], [0.0, 1.0, -2.9],   # stairs and the floor below
+           [3.0, 0.0, -3.0]]             # far in xy: not under the robot
+    assert vg.count(pts, 0.0, 0.0, 0.0) == 3
+    assert vg.count(pts, 0.0, 0.0, -3.0) == 0          # standing on the lower floor
+
+
+def test_virtual_ground_hysteresis():
+    from trav_exploration.voxel_mapper import VirtualGround
+    vg = VirtualGround(n_down=10, hold=3.0)
+    assert vg.update(5, 0.0) == (False, False)
+    assert vg.update(11, 1.0) == (True, True)          # more than N_down: look down
+    assert vg.update(0, 2.0) == (True, False)          # held
+    assert vg.update(11, 3.5) == (True, False)
+    assert vg.update(0, 6.0) == (True, False)
+    assert vg.update(0, 6.5) == (False, True)          # hold s without points below: look up
+
+
+def test_floor_area_counts_floor_not_stairs():
+    m = VoxelMapper(resolution=0.05, size_xy=8.0, z_above=3.0, robot_radius=0.22, mode='s')
+    k = m.layer(0.0)
+    xs = m.origin_xy + (np.arange(m.nx) + 0.5) * m.res
+    m.trav_s[xs < 0.0, :, k] = True                       # floor on x < 0
+    m.trav_s[(xs >= 0.0) & (xs < 1.0), :, k] = True       # stairs at the same height on 0 <= x < 1
+    m.stairs[(xs >= 0.0) & (xs < 1.0), :, k] = True
+    full = math.pi * 2.5 ** 2
+    a = m.floor_area(0.0, 0.0, 0.0)
+    assert 0.4 * full < a < 0.6 * full                    # the floor half of the disc only
+    assert m.floor_area(0.0, 0.0, 1.0) == 0.0             # nothing at another height
+    assert m.floor_area(3.0, 0.0, 0.0) < 0.1 * full       # beside the stairs, away from the floor
+
+
+def test_start_support_rejects_a_floor_far_under_the_robot():
+    from trav_exploration.voxel_mapper import start_support
+    # on a stair landing: the floor below seen down the stairwell, 0.58 m under base_link
+    z, rejected = start_support(-0.579, 0.0, 0.592, 0.88)
+    assert rejected and abs(z - (0.592 - 0.88)) < 1e-9
+    # on a floor: base_link 0.1 m above it
+    assert start_support(-0.1, 0.0, 0.79, 0.88) == (-0.1, False)
+    assert start_support(None, 0.0, 0.79, 0.88) == (None, False)
+
+
+def test_virtual_ground_looks_down_until_it_sees_no_more_below():
+    """Closed loop: one 30 deg step on the trigger, a further step while it shows clearly more
+    below Pi_vg, held where it stops paying; level again after hold s without points below."""
+    import math
+    from trav_exploration.voxel_mapper import VirtualGround
+    vg = VirtualGround(n_down=10, hold=3.0, step=math.radians(30), max_pitch=math.radians(60),
+                       settle=2, gain=0.1, rescan_move=1.0)
+    assert vg.update(11, 0.0, (0, 0)) == (True, True)
+    assert math.isclose(vg.pitch, math.radians(30))
+    vg.update(50, 0.1, (0, 0)); vg.update(50, 0.2, (0, 0))     # settling: frames of the old pitch
+    assert math.isclose(vg.pitch, math.radians(30))
+    vg.update(50, 0.3, (0, 0))                                 # 50 > 1.1 x 11: one step further
+    assert math.isclose(vg.pitch, math.radians(60)) and not vg.settled
+    for t in (0.4, 0.5):
+        vg.update(30, t, (0, 0))
+    vg.update(30, 0.6, (0, 0))                                 # fewer than at 30 deg: back, held
+    assert vg.settled and math.isclose(vg.pitch, math.radians(30))
+    vg.update(30, 0.7, (0.5, 0))
+    assert vg.settled                                          # not moved far enough to search again
+    vg.update(30, 0.8, (1.2, 0))                               # moved 1.2 m: search one step further
+    assert not vg.settled and math.isclose(vg.pitch, math.radians(60))
+    assert vg.update(0, 4.0, (1.2, 0)) == (False, True) and vg.pitch == 0.0
+
+
+def test_virtual_ground_holds_when_looking_further_down_adds_nothing():
+    import math
+    from trav_exploration.voxel_mapper import VirtualGround
+    vg = VirtualGround(n_down=10, step=math.radians(30), max_pitch=math.radians(60), settle=0)
+    vg.update(100, 0.0)
+    vg.update(105, 0.1)                                        # < 1.1 x 100: not worth going on
+    assert vg.settled and math.isclose(vg.pitch, math.radians(30))
+
+
+def test_virtual_ground_forced_going_down_stairs():
+    """Going down stairs: at least one step down without the trigger and no release."""
+    import math
+    from trav_exploration.voxel_mapper import VirtualGround
+    vg = VirtualGround(n_down=10, hold=3.0, step=math.radians(30), max_pitch=math.radians(60), settle=0)
+    vg.force(0.0)
+    assert vg.active and math.isclose(vg.pitch, math.radians(30))
+    vg.update(5, 0.1)                                          # first measure: one step further
+    assert math.isclose(vg.pitch, math.radians(60))
+    vg.update(2, 0.2)                                          # fewer: back to one step, not level
+    assert vg.settled and math.isclose(vg.pitch, math.radians(30))
+    assert vg.update(0, 10.0) == (True, False)                 # no release while forced
+    vg.reset()
+    assert vg.pitch == 0.0
+
+
+def _solid(m, x0, x1, y0, y1, z_top):
+    """Occupied box from the floor (z 0) up to z_top over x0..x1, y0..y1 (a step, a sofa...)."""
+    i0, i1 = (int((v - m.origin_xy) / m.res) for v in (x0, x1))
+    j0, j1 = (int((v - m.origin_xy) / m.res) for v in (y0, y1))
+    m.logodds[i0:i1, j0:j1, m.layer(-0.05):m.layer(z_top - 1e-6) + 1] = m.l_occ + 1.0
+
+
+def _floor(m):
+    m.logodds[:, :, m.layer(-0.05)] = m.l_occ + 1.0
+
+
+def test_stair_steps_counts_the_risers_of_a_flight():
+    m = VoxelMapper(resolution=0.05, size_xy=6.0, z_above=2.0)
+    _floor(m)
+    for s in range(1, 6):                      # five 0.18 m steps, 0.3 m treads, 1 m wide
+        _solid(m, 0.3 * s, 0.3 * s + 0.3, -0.5, 0.5, 0.18 * s)
+    risers, n_high, levels = m.stair_steps((0.0, 0.0, 0.0), (1.8, 0.0, 0.9))
+    assert risers >= 4 and n_high > 400 and len(levels) >= 5
+
+
+def test_stair_steps_a_threshold_or_a_sofa_is_no_flight():
+    m = VoxelMapper(resolution=0.05, size_xy=6.0, z_above=2.0)
+    _floor(m)
+    _solid(m, 0.5, 0.7, -0.5, 0.5, 0.15)       # a 0.15 m threshold
+    risers, n_high, _ = m.stair_steps((0.0, 0.0, 0.0), (1.5, 0.0, 0.15))
+    assert risers <= 1 and n_high >= 60        # raised part seen: no flight
+    m0 = VoxelMapper(resolution=0.05, size_xy=6.0, z_above=2.0)
+    _floor(m0)                                 # only the floor seen so far (stairs far away)
+    assert m0.stair_steps((0.0, 0.0, 0.0), (1.8, 0.0, 0.9))[1] == 0   # nothing raised observed: no verdict
+    m2 = VoxelMapper(resolution=0.05, size_xy=6.0, z_above=2.0)
+    _floor(m2)
+    _solid(m2, 0.5, 1.3, -1.0, 1.0, 0.45)      # sofa seat
+    _solid(m2, 1.3, 1.6, -1.0, 1.0, 0.85)      # its back
+    risers, n_high, _ = m2.stair_steps((0.0, 0.0, 0.0), (1.6, 0.0, 0.85))
+    assert risers == 0 and n_high > 300        # observed well, no step chain

@@ -90,3 +90,13 @@ def test_grid_path_reaches_the_nearest_free_cell_to_an_obstacle_goal():
     assert np.hypot(end[0] - 2.5, end[1] - 1.5) <= 1.0                         # next to it
     assert g[int(end[1] / res), int(end[0] / res)] == 0                         # on a free cell
     assert grid_path(g, (0.0, 0.0), res, (0.5, 1.5), (2.5, 1.5), goal_radius=0.3) is None
+
+
+def test_cost_matrix_node_cost_enters_each_candidate():
+    # the value-map term lambda_v (1 - u_j) is added on the way into candidate j, not out of it
+    J = np.array([[1.0, 1.0], [0.0, 2.0], [2.0, 0.0]])
+    C = cost_matrix(J, 0.5, node_cost=[3.0, 0.0])
+    assert np.allclose(C, [[0.0, 4.5, 1.5], [0.0, 0.0, 2.5], [0.0, 5.5, 0.0]])
+    # a high-value candidate farther away now comes first in the tour
+    order = solve_open_atsp(C)
+    assert order[0] == 2

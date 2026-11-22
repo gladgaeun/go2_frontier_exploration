@@ -1,0 +1,17 @@
+# Goal for a target object (O_tar) on the support graph of the latest snapshot (voxel_mapper_node,
+# trav3d.SupportGraph.target_goal): the node the robot reaches cheapest from which k_min of the
+# object's points lie within r_goal (xy), none closer than r_min, with the goal clearance.
+geometry_msgs/Point source
+geometry_msgs/Point[] points    # the target cluster (instance map)
+float64 r_min
+float64 r_goal
+int32 k_min
+---
+bool ok                         # false: no map / graph yet
+bool found                      # a reachable goal node
+geometry_msgs/Point goal
+float64 cost                    # J_geo to it
+int32 n_near                    # nodes within r_min..r_goal of a point (on the object's floor)
+int32 n_ring                    # ... with k_min points within r_goal
+int32 n_clear                   # ... with the goal clearance
+int32 n_reach                   # ... reachable from the source

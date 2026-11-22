@@ -4,6 +4,10 @@
 # voxel map pairs it with the depth frame of the same time. The drop-in replacement for
 # habitat_server --semantic (ground truth).
 #
+# With detect_queries (the instance map's Q_obj and Q_land, e.g. ["stairs", "couch"]) the server also
+# returns an instance mask and a confidence per detection of those queries; they go out on
+# camera/detections (trav_interfaces/Detections), stamped like the image (instance_map_node).
+#
 # Only the newest image is sent; images arriving while the server is busy (~0.2 s per image with
 # three prompts on an RTX 5070 Ti) are dropped. The request runs in a thread of its own so the
 # image callback never waits for the server.
@@ -17,6 +21,8 @@ import zmq
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 
+from trav_interfaces.msg import Detections
+
 
 class SemanticSegNode(Node):
 
@@ -28,6 +34,12 @@ class SemanticSegNode(Node):
         self.min_period = float(p('min_period', 0.0).value)     # s of sim time between requests
         self.pub = self.create_publisher(Image, p('semantic_topic', 'camera/semantic/image_raw').value, 2)
         self.create_subscription(Image, p('image_topic', 'camera/image_raw').value, self._on_image, 2)
+        # "name" or "name=prompt": detect_queries (landmarks) + target (comma-separated objects)
+        queries = [q for q in list(p('detect_queries', ['stairs']).value)
+                   + str(p('target', '').value).split(',') if q.strip()]
+        self.detect = dict(q.split('=', 1) if '=' in q else (q, q) for q in queries)
+        self.det_pub = self.create_publisher(Detections, p('detections_topic', 'camera/detections').value, 2) \
+            if self.detect else None
         self.ctx = zmq.Context()
         self.sock = None
         self._connect()
@@ -35,7 +47,8 @@ class SemanticSegNode(Node):
         self.cv = threading.Condition()
         self.n, self.t_sum, self.last_stamp = 0, 0.0, None
         threading.Thread(target=self._worker, daemon=True).start()
-        self.get_logger().info(f'segmenting camera images with sam3_server at {self.address}')
+        self.get_logger().info(f'segmenting camera images with sam3_server at {self.address}'
+                               + (f', detecting {self.detect}' if self.detect else ''))
 
     def _connect(self):
         if self.sock is not None:
@@ -69,8 +82,10 @@ class SemanticSegNode(Node):
     def _segment(self, msg):
         w, h = msg.width, msg.height
         rgb = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, -1)[:, :3 * w]
-        self.sock.send_multipart([json.dumps({'op': 'segment', 'width': w, 'height': h}).encode(),
-                                  np.ascontiguousarray(rgb).tobytes()])
+        req = {'op': 'segment', 'width': w, 'height': h}
+        if self.detect:
+            req['detect'] = self.detect
+        self.sock.send_multipart([json.dumps(req).encode(), np.ascontiguousarray(rgb).tobytes()])
         if not self.sock.poll(self.timeout_ms):
             self.get_logger().warn(f'no answer from sam3_server at {self.address} - is it running? retrying...',
                                    throttle_duration_sec=5.0)
@@ -84,6 +99,13 @@ class SemanticSegNode(Node):
         out = Image(header=msg.header, height=h, width=w, encoding='mono8', step=w)
         out.data = parts[1]
         self.pub.publish(out)
+        if self.det_pub is not None:
+            dets = hdr.get('detections', [])
+            d = Detections(header=msg.header, height=h, width=w)
+            d.queries = [x['query'] for x in dets]
+            d.scores = [float(x['score']) for x in dets]
+            d.masks = parts[2] if len(parts) > 2 else b''
+            self.det_pub.publish(d)
         self.n += 1
         self.t_sum += hdr['ms']
         if self.n % 50 == 0:

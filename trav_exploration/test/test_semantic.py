@@ -18,7 +18,8 @@ def test_split_classes():
 
 
 def test_mode_switch_hysteresis():
-    sw = ModeSwitch(enter_time=0.5, exit_time=2.0, min_stair_points=10, enter_range=4.0, exit_distance=5.0)  # explicit values
+    sw = ModeSwitch(enter_time=0.5, min_stair_points=10, enter_range=4.0, exit_distance=5.0,
+                    auto_enter=True, exit_rule='distance', exit_frames=40)  # explicit values
     t = iter(np.arange(0.0, 100.0, 0.05))                # camera frames at 20 Hz
     assert not sw.update(next(t), 20, np.inf)            # 0.00 s: first stair frame
     assert not sw.update(next(t), 20, np.inf)
@@ -26,18 +27,50 @@ def test_mode_switch_hysteresis():
     changed = [sw.update(next(t), 20, np.inf) for _ in range(11)]
     assert changed == [False] * 10 + [True] and sw.mode == 's'   # 0.5 s of stair frames
     far = [sw.update(next(t), 0, 6.0) for _ in range(30)]
-    assert not any(far)                                  # 1.5 s far: not yet
+    assert not any(far)                                  # 30 frames far: not yet
     assert not sw.update(next(t), 0, 4.5)                # back near the stairs: restarts
-    far = [sw.update(next(t), 0, 6.0) for _ in range(41)]
-    assert far[-1] and not any(far[:-1]) and sw.mode == 'g'      # 2.0 s far
+    far = [sw.update(next(t), 0, 6.0) for _ in range(40)]
+    assert far[-1] and not any(far[:-1]) and sw.mode == 'g'      # N_exit = 40 frames far
 
 
 def test_few_stair_pixels_do_not_switch():
-    sw = ModeSwitch(enter_time=0.5, min_stair_points=50)
+    sw = ModeSwitch(enter_time=0.5, min_stair_points=50, auto_enter=True)
     for k in range(200):
         assert not sw.update(0.05 * k, 30, np.inf)       # a glimpse of a few stair pixels
     assert sw.mode == 'g'
     assert sw.request('s') and sw.mode == 's'            # planner request (stair landmark)
+
+
+def test_mode_s_only_on_request():
+    # default: seeing stairs does not switch (that is the instance map's job); the planner's
+    # request to take the stairs does, and the end of the climb switches back
+    sw = ModeSwitch(enter_time=0.5, min_stair_points=10)
+    for k in range(200):
+        assert not sw.update(0.05 * k, 5000, 0.5)       # many stair pixels, right at the stairs
+    assert sw.mode == 'g'
+    assert sw.request('s') and sw.mode == 's'
+    assert sw.request('g') and sw.mode == 'g'
+    assert not sw.request('g')                           # no change
+
+
+def test_mode_s_exits_after_n_exit_frames_far_from_the_stairs():
+    # the paper's rule (default): sufficiently far from the stair region for N_exit frames
+    sw = ModeSwitch(exit_distance=1.0, exit_frames=5)
+    sw.request('s')
+    assert [sw.update(0.3 * k, 500, 1.5) for k in range(4)] == [False] * 4   # far (stairs in view or not)
+    assert not sw.update(1.2, 0, 0.6) and sw.mode == 's'                    # near again: restarts
+    out = [sw.update(1.5 + 0.3 * k, 0, 1.2) for k in range(5)]
+    assert out == [False] * 4 + [True] and sw.mode == 'g'                   # 5th far frame: back to g
+
+
+def test_mode_s_exits_after_n_exit_frames_without_stairs():
+    sw = ModeSwitch(min_stair_points=10, exit_frames=5, exit_rule='sight')
+    sw.request('s')
+    assert [sw.update(0.3 * k, 0, 0.0) for k in range(4)] == [False] * 4   # 4 frames without stairs
+    assert not sw.update(1.2, 50, 0.0) and sw.mode == 's'                 # stairs again: restarts
+    out = [sw.update(1.5 + 0.3 * k, 3, 0.0) for k in range(5)]           # a few pixels are not stairs
+    assert out == [False] * 4 + [True] and sw.mode == 'g'                  # 5th frame: back to g
+    assert not sw.update(3.0, 0, 0.0) and sw.mode == 'g'
 
 
 def _step_scene():

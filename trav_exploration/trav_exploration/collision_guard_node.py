@@ -43,6 +43,18 @@ class CollisionGuardNode(Node):
         self.map_frame = p('map_frame', 'map').value
         self.base_frame = p('base_frame', 'base_link').value
         self.radius = float(p('robot_radius', 0.25).value)       # real body radius
+        # 'full': stop before contact, close cells too narrow for the body, block and back out on
+        # repeated Nav2 failures, and follow the 3-D paths of a stair climb. 'path_only': the 3-D
+        # paths and the paper's execute-review only (Sec. IV-B conservative map update); Nav2's
+        # commands pass through. A blocked robot: voxel_mapper_node stuck event (eq. 17, v_front
+        # occupied); a robot whose controller will not drive the way the plan goes (a gap open
+        # on M_trav but too narrow for Nav2 to follow: RPP 'collision ahead', recoveries, abort)
+        # never commands forward motion, so eq. 17 does not see it: there two aborts at one spot
+        # mark the way ahead occupied the same way (tried, failed -> not traversable). Nav2
+        # cannot drive the stairs, so the 3-D path follower stays.
+        self.mode = str(p('guard_mode', 'full').value)
+        if self.mode not in ('full', 'path_only'):
+            raise ValueError(f"guard_mode must be 'full' or 'path_only', got {self.mode!r}")
         # look-ahead beyond the body: radius + 0.1 = 0.35 m from the centre, below the 0.4 m goal
         # clearance, so the guard does not stop the robot short of goals placed near walls
         self.distance = float(p('stop_distance', 0.1).value)
@@ -51,6 +63,11 @@ class CollisionGuardNode(Node):
         # the voxel map's path protection (inflation + 2 cells, VoxelMapper.near_visited)
         self.block_distance = float(p('block_distance', 0.37).value)
         self.h_min = float(p('h_min', 0.1).value)
+        # on a 3-D path (stair climb) an obstacle point this low above the support is the next
+        # step (its nosing, not labelled stairs by SAM3), which the robot steps onto: the top of
+        # the spiral stairs of 00820 held the robot 0.12 m below one for 25 retries
+        self.step_clear = float(p('step_clear', 0.25).value)
+        self.map_rel = np.zeros(0)
         self.h_max = float(p('h_max', 0.6).value)
         self.stride = int(p('pixel_stride', 8).value)
         self.near = float(p('near_range', 2.0).value)            # points farther away are ignored
@@ -135,7 +152,9 @@ class CollisionGuardNode(Node):
         self.cmd = (msg.linear.x, msg.angular.z)
         if self.escape is not None:
             return                   # _escape_step drives the robot
-        vx, wz = self.gate.filter(self._now(), msg.linear.x, msg.angular.z)
+        vx, wz = msg.linear.x, msg.angular.z
+        if self.mode == 'full':
+            vx, wz = self.gate.filter(self._now(), vx, wz)
         out = Twist()
         out.linear.x, out.angular.z = float(vx), float(wz)
         self.cmd_pub.publish(out)
@@ -161,7 +180,9 @@ class CollisionGuardNode(Node):
         pts = np.array([[q[0], q[1], q[2]] for q in
                         point_cloud2.read_points(msg, field_names=('x', 'y', 'z'))]).reshape(-1, 3)
         rel = pts[:, 2] - self.support_z
-        self.map_pts = pts[(rel > self.h_min) & (rel < self.h_max), :2]
+        keep = (rel > self.h_min) & (rel < self.h_max)
+        self.map_pts = pts[keep, :2]
+        self.map_rel = rel[keep]
 
     def _key(self, xy):
         return [tuple(k) for k in np.floor(np.asarray(xy).reshape(-1, 2) / self.res).astype(int)]
@@ -195,6 +216,8 @@ class CollisionGuardNode(Node):
         except TransformException:
             return
         self.trail.add(base_p[0], base_p[1])
+        if self.mode != 'full':
+            return
         depth = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, -1)[:, :msg.width]
         z = depth[self.pix].astype(np.float64)
         ok = np.isfinite(z) & (z > 0.0) & (z < self.near)
@@ -260,8 +283,10 @@ class CollisionGuardNode(Node):
             self._publish_block(block, self.get_clock().now().to_msg())
             self.get_logger().warn(
                 f'[guard] navigation failed {self.aborts.n} times at ({base_p[0]:.2f}, {base_p[1]:.2f}): '
-                f'way ahead (heading {math.degrees(yaw):.0f} deg) marked blocked')
-            self._start_escape(base_p)
+                f'way ahead (heading {math.degrees(yaw):.0f} deg) marked blocked'
+                + (' (execute-review)' if self.mode == 'path_only' else ''))
+            if self.mode == 'full':                # backing out along the trail: not in the paper
+                self._start_escape(base_p)
 
     # -- escape back along the trail ------------------------------------------------
     def _start_escape(self, base_p):
@@ -350,10 +375,18 @@ class CollisionGuardNode(Node):
             vx, wz = follow(base_p[0], base_p[1], yaw, wps[i],
                             speed=self.path_speed if path else self.escape_speed)
             c, s = math.cos(yaw), math.sin(yaw)
+            # path_only (the paper): a 3-D path planned on M_trav is executed as it is; a robot
+            # that really gets blocked is the execute-review's (voxel_mapper_node stuck event,
+            # eq. 17). This extra check stopped the robot at the start of every stretch when it
+            # stood next to a wall (00823: a landing, 0.03 m from the wall, 5 stretches 'blocked'
+            # at its own position, no forward command, so no stuck event either).
+            check = not (path and self.mode == 'path_only')
             # observed obstacles only: blocked voxels are guesses of where the robot got stuck,
             # and one marked while escaping lay on the trail and stopped every later escape
-            d = self.map_pts - base_p[:2]
+            d = self.map_pts - base_p[:2] if check else np.zeros((0, 2))
             close = np.hypot(d[:, 0], d[:, 1]) < 1.0 if len(d) else np.zeros(0, dtype=bool)
+            if path and len(close) == len(self.map_rel) and len(close):
+                close &= self.map_rel >= self.step_clear
             if close.any() and self.blocked_keys:
                 idx = np.flatnonzero(close)
                 virtual = np.array([k in self.blocked_keys for k in self._key(self.map_pts[idx])])

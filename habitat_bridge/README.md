@@ -81,7 +81,8 @@ gaps in walls. Exploration ends with `Exploration complete!` when no new frontie
 
 | option | default | note |
 |---|---|---|
-| `--agent-radius` | 0.25 | navmesh radius, kept slightly above Nav2 `robot_radius` (0.22) |
+| `--agent-radius`, `--agent-height` | 0.18, 0.88 | agent body of Habitat Challenge 2023 ObjectNav (habitat-lab `objectnav_hm3d.yaml`); navmesh radius kept slightly above the inflation radius (trav_exploration 0.15). The 2D single-floor stack (Nav2 `robot_radius` 0.22) was tuned with `--agent-radius 0.25 --agent-height 0.6` |
+| `--no-sliding` | off | stop dead on contact (Habitat ObjectNav `allow_sliding: False`, meant for its discrete agent); with continuous velocity commands the agent got pinned at every graze of the navmesh edge, on stairs above all |
 | `--start-clearance` | 0.6 | random start pose keeps this distance from obstacles |
 | `--laser-height` | 0.4 | height of the virtual 2D LiDAR plane |
 | `--max-range` | 10.0 | keep equal to slam_toolbox `max_laser_range` |

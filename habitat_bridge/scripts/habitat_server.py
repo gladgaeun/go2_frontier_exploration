@@ -339,7 +339,11 @@ class HabitatRobot:
         for k in range(4):
             self._set_pose(self.start_pos, self.start_yaw_hab + k * math.pi / 2.0)
             imgs.append(np.asarray(self.sim.get_sensor_observations()['depth'], dtype=np.float64))
-        drop = floor_drop(imgs, a.camera_hfov)
+        # the floor under the agent is 0.1 m above to 0.3 m below its base (navmesh cells); a
+        # lower floor in view (a stairwell, the storey below) was read as the floor in HM3D v1
+        # 00820 (0.418 m: camera at 1.30 m, the voxel map found no floor and the episode ended)
+        b = self.camera_height_base
+        drop = floor_drop(imgs, a.camera_hfov, lo=b - 0.1, hi=b + 0.3)
         if drop is None:
             print('[habitat_server] camera height: floor not seen at the start, kept above the agent base')
             return
@@ -465,7 +469,8 @@ class HabitatRobot:
             self.vc.angular_velocity = mn.Vector3(0.0, wz, 0.0)
             start = hs.RigidState(self.node.rotation, self.node.translation)
             target = self.vc.integrate_transform(dt, start)
-            end = self.sim.pathfinder.try_step(start.translation, target.translation)
+            step = self.sim.pathfinder.try_step if self.args.sliding else self.sim.pathfinder.try_step_no_sliding
+            end = step(start.translation, target.translation)
             end = mn.Vector3(*[float(v) for v in end])
             wanted = target.translation - start.translation
             got = end - start.translation
@@ -566,11 +571,20 @@ def parse_args(argv=None):
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--start', default='', help='habitat "x,y,z,yaw"; random navigable point if empty')
     p.add_argument('--min-island-radius', type=float, default=3.0)
-    p.add_argument('--agent-radius', type=float, default=0.25,
-                   help='navmesh radius; keep slightly ABOVE Nav2 robot_radius (0.22)')
+    # agent body of Habitat Challenge 2023 ObjectNav (habitat-lab objectnav_hm3d.yaml: height
+    # 0.88 m, radius 0.18 m, allow_sliding False), the paper's simulation benchmark
+    p.add_argument('--agent-radius', type=float, default=0.18,
+                   help='navmesh radius (Habitat ObjectNav 0.18); keep slightly ABOVE the inflation radius (0.15)')
     p.add_argument('--start-clearance', type=float, default=0.6,
                    help='min distance from obstacles for a random start pose [m]')
-    p.add_argument('--agent-height', type=float, default=0.6)
+    p.add_argument('--agent-height', type=float, default=0.88, help='Habitat ObjectNav 0.88 m')
+    # Sliding along walls stays on: Habitat ObjectNav has allow_sliding False for its discrete
+    # agent (turn, then 0.25 m straight); with continuous velocity commands (Nav2) the agent
+    # stuck at every graze of the navmesh edge, on stairs above all (HM3D v1, 2026-11-16: up to
+    # 15949 collisions and 1.5 m travelled in an episode). The paper's setup (Sec. VII-A) does
+    # not specify it.
+    p.add_argument('--no-sliding', dest='sliding', action='store_false',
+                   help='stop dead on contact (Habitat ObjectNav allow_sliding False; for discrete agents)')
     p.add_argument('--max-climb', type=float, default=0.1,
                    help='max step height on the navmesh [m]; 0.1 keeps stairs out (single floor), '
                         '0.2 (Habitat default) connects the floors of 00800 over its stairs')
@@ -596,6 +610,10 @@ def parse_args(argv=None):
                    help='ground-truth semantic class image next to the RGB camera (HM3D annotation; '
                         'finds hm3d_annotated_*scene_dataset_config.json above the scene if '
                         '--dataset-config is not given)')
+    p.add_argument('--trajectory', default='',
+                   help='write the agent pose (habitat "t x y z yaw", sim time) to this file every '
+                        '--trajectory-period s of sim time and at the end (ObjectNav evaluation)')
+    p.add_argument('--trajectory-period', type=float, default=0.2)
     p.add_argument('--max-lin-vel', type=float, default=1.0)
     p.add_argument('--max-ang-vel', type=float, default=2.0)
     return p.parse_args(argv)
@@ -622,6 +640,14 @@ def main():
     poller = zmq.Poller()
     poller.register(sock, zmq.POLLIN)
     t_report = time.time()
+    traj = open(args.trajectory, 'w', buffering=1) if args.trajectory else None
+    t_traj = -1e9
+
+    def write_pose():
+        pos = robot.node.translation
+        fwd = robot.node.rotation.transform_vector(robot.mn.Vector3(0.0, 0.0, -1.0))
+        yaw = math.atan2(-fwd[0], -fwd[2])                      # habitat yaw about +y
+        traj.write(f'{robot.sim_time:.3f} {pos[0]:.4f} {pos[1]:.4f} {pos[2]:.4f} {yaw:.4f}\n')
     while running:
         if not poller.poll(200):
             continue
@@ -649,11 +675,17 @@ def main():
             print(f'[habitat_server] error: {e!r}')
             continue
 
+        if traj is not None and robot.sim_time - t_traj >= args.trajectory_period:
+            t_traj = robot.sim_time
+            write_pose()
         if time.time() - t_report > 10.0:
             t_report = time.time()
             print(f'[habitat_server] t_sim={robot.sim_time:7.1f}s  path={robot.path_length:6.1f}m  '
                   f'collisions={robot.collisions}  closest_scan={min_scan:.2f}m')
 
+    if traj is not None:
+        write_pose()
+        traj.close()
     print(f'[habitat_server] done. sim_time={robot.sim_time:.1f}s path_length={robot.path_length:.1f}m '
           f'collisions={robot.collisions}')
     sock.close(0)

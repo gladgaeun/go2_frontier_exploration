@@ -82,8 +82,27 @@ def traverse_2d(start, end):
     return np.concatenate([np.floor(start).astype(np.int64), np.floor(end).astype(np.int64), cells])
 
 
+def start_support(est, base_z, cam_z, camera_height, max_below=0.25):
+    """Support height at the start from the floor estimate est (None: no level floor in view).
+
+    The robot stands on its support: base_link is 0.2 m below to 0.08 m above the floor in HM3D
+    (habitat_server). A level surface found more than max_below under base_link is not what the
+    robot stands on: from a stair landing (00802) the floor of the storey below, seen down the
+    stairwell, outweighs the small steps and the landing around the robot, and the whole map was
+    built 0.58 m under the robot (the landing an obstacle, the stairs above cut off). The support
+    is then camera_height under the camera (the start pose of habitat_server). Returns
+    (support z or None, True when est was rejected)."""
+    if est is None:
+        return None, False
+    if base_z - est > max_below:
+        return cam_z - camera_height, True
+    return est, False
+
+
 class VoxelMapper:
     UNKNOWN, FREE, OCC = -1, 0, 100
+    # origin of M_s / stair voxels (sem_src bits; debug)
+    SRC_SEG, SRC_SEG_STAIR, SRC_PROMOTED, SRC_GEO, SRC_GEO_STEP = 1, 2, 4, 8, 16
 
     def __init__(self, resolution=0.05, size_xy=30.0, z_below=0.25, z_above=2.0,
                  l_hit=0.85, l_miss=-0.4, l_min=-2.0, l_max=3.5, l_occ=0.7,
@@ -100,6 +119,8 @@ class VoxelMapper:
         self.trav_s = np.zeros(shape, dtype=bool)              # M_s: semantic segmentation
         self.stairs = np.zeros(shape, dtype=bool)              # stair-class voxels (part of M_s)
         self.stair_seen = np.zeros(shape, dtype=bool)          # every stair-labelled voxel, trusted or not
+        # debug: where each M_s voxel came from (bits SRC_*), kept in the climb dumps
+        self.sem_src = np.zeros(shape, dtype=np.uint8)
         self.stair_xy = np.zeros((0, 2))                       # their centres in xy, for distances
         self.stair_z = np.zeros(0)                             # and their heights
         self.inflated = np.zeros(shape, dtype=bool)            # O_inf
@@ -121,7 +142,7 @@ class VoxelMapper:
         self.dz_lo = min(int(np.floor(h_min / self.res + 1e-9)) + 1, self.n_h)   # 0.1 / 0.1 -> 2
         self.robot_radius = robot_radius
         r = robot_radius / self.res
-        ri = int(np.floor(r))
+        ri = int(np.floor(r + 1e-6))        # 0.15 / 0.05 = 2.9999...: 3 cells, not 2
         self.r_cells = ri
         self.disk = [(dx, dy) for dx in range(-ri, ri + 1) for dy in range(-ri, ri + 1)
                      if dx * dx + dy * dy <= r * r]
@@ -293,7 +314,7 @@ class VoxelMapper:
             out &= lo[np.maximum(flat_idx - dz, 0)] <= th
         return out
 
-    def integrate_semantic(self, points, stair_points=None):
+    def integrate_semantic(self, points, stair_points=None, src=1, stair_src=2):
         """Insert the voxels of traversable-class pixels (floor, stair, rug, ...) into M_s.
 
         stair_points (part of points) are also recorded as stair voxels. Returns the number of
@@ -304,8 +325,10 @@ class VoxelMapper:
         s = self.trav_s.reshape(-1)
         added = idx[~s[idx]]
         s[added] = True
+        self.sem_src.reshape(-1)[idx] |= np.uint8(src)
         if stair_points is not None and len(stair_points):
             sidx = self._flat(stair_points)
+            self.sem_src.reshape(-1)[sidx] |= np.uint8(stair_src)
             st = self.stairs.reshape(-1)
             new = sidx[~st[sidx]]
             if new.size:
@@ -409,8 +432,129 @@ class VoxelMapper:
         if not keep.any():
             return 0
         flat = np.ravel_multi_index((ii[keep], jj[keep], kk[keep] + k_lo), self.logodds.shape)
-        self.integrate_semantic(self.centers(flat), self.centers(flat))
+        self.integrate_semantic(self.centers(flat), self.centers(flat),
+                                src=self.SRC_PROMOTED, stair_src=self.SRC_PROMOTED)
         return int(keep.sum())
+
+    def geometric_treads(self, x, y, z_r, radius=2.0, up=1.2, down=0.3, max_step=0.25, stair_near=0.5,
+                         hint=None, step_near=0.4):
+        """Treads the segmentation missed, by geometry (mode s, while climbing).
+
+        Where a staircase turns, SAM3 often leaves the treads and risers of the turn unlabelled:
+        they stayed occupied and outside T, so they were inflation sources (S_inf = O minus T), their
+        O_inf cut the support graph between the trusted steps, and voxel_map/obstacles (the
+        collision guard) held the robot (00803: 13 of 15 dev climb stops had 90-310 such voxels
+        within 0.6 m). A geometric fallback, after the paper's step-height reasoning: an occupied
+        voxel is a tread when it is a top surface (the voxel above is not occupied) with n_h
+        layers of headroom, and it is reached from the robot's support over surfaces (T or such
+        treads) at most max_step apart in height and one cell apart in xy. Only within `radius` of
+        the robot, from `down` below z_r to `up` above, and within stair_near (xy, +-max_step in
+        z) of stair-labelled voxels, or within hint = (x, y, r) of the stairs the planner asked to
+        climb (an instance-map landmark: the voxel map may hold no stair label there, e.g. steps
+        going down seen only from the stair head): a sofa or an ottoman next to the floor is never a tread. The
+        occupied voxels under a tread down to max_step (its riser) go with it. Returns the flat
+        indices of the voxels to add to M_s (not in T yet), and those of them that are steps: with
+        a surface one step higher or lower within step_near (a floor reached on the way is no
+        step, else the arrival test, flat support off the stairs, never held)."""
+        res = self.res
+        r = int(np.ceil(radius / res))
+        ci, cj = int((x - self.origin_xy) / res), int((y - self.origin_xy) / res)
+        k_lo, k_top = max(self.layer(z_r - down), 0), min(self.layer(z_r + up), self.nz - 1)
+        hh = self.n_h
+        i0, i1 = max(ci - r, 0), min(ci + r + 1, self.nx)
+        j0, j1 = max(cj - r, 0), min(cj + r + 1, self.ny)
+        k1 = min(k_top + hh + 1, self.nz)
+        none = (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64))
+        if i0 >= i1 or j0 >= j1 or k_lo >= k1:
+            return none
+        box = (slice(i0, i1), slice(j0, j1), slice(k_lo, k1))
+        occ = (self.logodds[box] >= self.l_occ) | self.blocked[box]
+        src = self._source(box)
+        nz = occ.shape[2]
+        ks = max(1, int(round(max_step / res)))
+        top = occ.copy()
+        top[:, :, :-1] &= ~occ[:, :, 1:]
+        head = np.zeros_like(occ)                                   # occupied within n_h above
+        for d in range(1, min(hh, nz - 1) + 1):
+            head[:, :, :nz - d] |= occ[:, :, d:]
+        cand = top & ~head
+        cand[:, :, k_top - k_lo + 1:] = False
+
+        def spread(a, rad_xy, rad_z):
+            out = a.copy()
+            for d in range(1, rad_z + 1):
+                out[:, :, :nz - d] |= a[:, :, d:]
+                out[:, :, d:] |= a[:, :, :nz - d]
+            o2 = out.copy()
+            nx_, ny_ = out.shape[:2]
+            for dx in range(-rad_xy, rad_xy + 1):          # no wrap-around at the box edges
+                for dy in range(-rad_xy, rad_xy + 1):
+                    if not (dx or dy) or abs(dx) >= nx_ or abs(dy) >= ny_:
+                        continue
+                    xs, xd = (slice(0, nx_ - dx), slice(dx, nx_)) if dx >= 0 else (slice(-dx, nx_), slice(0, nx_ + dx))
+                    ys, yd = (slice(0, ny_ - dy), slice(dy, ny_)) if dy >= 0 else (slice(-dy, ny_), slice(0, ny_ + dy))
+                    o2[xd, yd, :] |= out[xs, ys, :]
+            return o2
+
+        stairs = (self.stair_seen[box] | self.stairs[box])
+        region = spread(stairs, int(round(stair_near / res)), ks) if stairs.any() else np.zeros_like(occ)
+        if hint is not None:
+            Ih, Jh = np.meshgrid(np.arange(i0, i1), np.arange(j0, j1), indexing='ij')
+            hx, hy, hr = hint
+            col = np.hypot(self.origin_xy + (Ih + 0.5) * res - hx, self.origin_xy + (Jh + 0.5) * res - hy) <= hr
+            region |= col[:, :, None]
+        if not region.any():
+            return none
+        cand &= region
+        walk = cand | src
+        # seed: the robot's own support (T within 0.6 m and one step of z_r)
+        I, J = np.meshgrid(np.arange(i0, i1), np.arange(j0, j1), indexing='ij')
+        near = np.hypot(I - ci, J - cj) * res <= 0.6
+        kr = self.layer(z_r) - k_lo
+        reach = np.zeros_like(occ)
+        lo_, hi_ = max(kr - ks, 0), min(kr + ks + 1, nz)
+        reach[:, :, lo_:hi_] = src[:, :, lo_:hi_] & near[:, :, None]
+        if not reach.any():
+            return none
+        for _ in range(4 * r):
+            grown = spread(reach, 1, ks) & walk
+            if np.array_equal(grown, reach):
+                break
+            reach = grown
+        treads = reach & cand & ~src
+        if not treads.any():
+            return none
+        riser = treads.copy()                                        # occupied below, one step
+        for d in range(1, ks + 1):
+            below = np.zeros_like(treads)
+            below[:, :, :nz - d] = treads[:, :, d:]
+            riser |= below & occ
+        add = riser & ~src
+        # steps: treads with another surface one step (0.1 m .. max_step) higher or lower within
+        # step_near (xy). Tread patches smaller than a floor were taken before, but the floor
+        # below the stairs comes into view in small patches frame by frame: 4000 voxels of it were
+        # labelled stairs, the arrival test (flat support off the stairs) never held, and the
+        # robot passed a reliable target to go on down (00847).
+        from scipy import ndimage
+        surf = treads | src
+        other = np.zeros_like(surf)
+        for d in range(max(2, int(round(0.1 / res))), ks + 1):
+            other[:, :, d:] |= surf[:, :, :nz - d]
+            other[:, :, :nz - d] |= surf[:, :, d:]
+        rs = int(round(step_near / res))
+        disk = np.zeros((2 * rs + 1, 2 * rs + 1, 1), dtype=bool)
+        yy, xx = np.mgrid[-rs:rs + 1, -rs:rs + 1]
+        disk[:, :, 0] = xx * xx + yy * yy <= rs * rs
+        steps = treads & ndimage.binary_dilation(other, structure=disk)
+        st_r = steps.copy()                                          # and their risers
+        for d in range(1, ks + 1):
+            below = np.zeros_like(steps)
+            below[:, :, :nz - d] = steps[:, :, d:]
+            st_r |= below & occ
+        def flat(mask):
+            ii, jj, kk = np.nonzero(mask)
+            return np.ravel_multi_index((ii + i0, jj + j0, kk + k_lo), self.logodds.shape)
+        return flat(add), flat(st_r & add)
 
     def stair_landmarks(self, min_voxels=150, merge=0.15, part=0.25):
         """Stair landmarks (O_stair, Sec. V-A, simplified): connected groups of stair-labelled
@@ -439,6 +583,74 @@ class VoxelMapper:
             high = c[c[:, 2] >= c[:, 2].max() - part]
             out.append((*low[:, :2].mean(axis=0), c[:, 2].min(), *high[:, :2].mean(axis=0), c[:, 2].max(), len(vox)))
         return out
+
+    def floor_area(self, x, y, z_r, radius=2.5, dz=0.1):
+        """Area [m^2] of support (T) that is not stairs, within radius (xy) of (x, y) and dz of
+        z_r: a floor next to the robot, not a landing of the stairs (a few cells)."""
+        r = int(math.ceil(radius / self.res))
+        i, j = int((x - self.origin_xy) / self.res), int((y - self.origin_xy) / self.res)
+        k0, k1 = self.layer(z_r - dz), self.layer(z_r + dz) + 1
+        i0, i1 = max(i - r, 0), min(i + r + 1, self.nx)
+        j0, j1 = max(j - r, 0), min(j + r + 1, self.ny)
+        k0, k1 = max(k0, 0), min(k1, self.nz)
+        if i0 >= i1 or j0 >= j1 or k0 >= k1:
+            return 0.0
+        box = (slice(i0, i1), slice(j0, j1), slice(k0, k1))
+        cols = (self._source(box) & ~self.stairs[box]).any(axis=2)
+        ii, jj = np.meshgrid(np.arange(i0, i1) - i, np.arange(j0, j1) - j, indexing='ij')
+        cols &= ii ** 2 + jj ** 2 <= r * r
+        return float(cols.sum()) * self.res ** 2
+
+    def stair_steps(self, p0, p1, half_width=0.6, below=0.3, above=0.3, min_cells=10, rise=(0.08, 0.27)):
+        """Geometric check of a stair landmark (not in the paper: the verification of a tentative
+        hypothesis, Sec. V-A, by the step structure). In the corridor half_width (xy) around the
+        segment from p0 (foot) to p1 (top) and between their heights (below / above as margin),
+        the top surfaces (an occupied voxel with the two above it free) are grouped by height;
+        a height with at least min_cells of them is a level (adjacent layers merged). Returns
+        (risers, n_high, levels): risers = steps of the longest chain of levels each `rise` above
+        the previous one (a flight of two steps: 2; a threshold or a rug on the floor: 0 or 1),
+        n_high the number of top-surface cells seen there above the foot (z0 + rise[0]): how much
+        of the raised part is observed (the floor around the foot does not count, else a flight
+        seen from afar, its treads not mapped yet, would count as observed)."""
+        res = self.res
+        x0, y0, z0 = (float(v) for v in p0)
+        x1, y1, z1 = (float(v) for v in p1)
+        lo, hi = min(z0, z1) - below, max(z0, z1) + above
+        i0 = max(int((min(x0, x1) - half_width - self.origin_xy) / res), 0)
+        i1 = min(int((max(x0, x1) + half_width - self.origin_xy) / res) + 1, self.nx)
+        j0 = max(int((min(y0, y1) - half_width - self.origin_xy) / res), 0)
+        j1 = min(int((max(y0, y1) + half_width - self.origin_xy) / res) + 1, self.ny)
+        k0, k1 = max(self.layer(lo), 0), min(self.layer(hi) + 3, self.nz)
+        if i0 >= i1 or j0 >= j1 or k1 - k0 < 3:
+            return 0, 0, []
+        occ = self.logodds[i0:i1, j0:j1, k0:k1] >= self.l_occ
+        top = occ[:, :, :-2] & ~occ[:, :, 1:-1] & ~occ[:, :, 2:]
+        X = self.origin_xy + (np.arange(i0, i1) + 0.5) * res
+        Y = self.origin_xy + (np.arange(j0, j1) + 0.5) * res
+        XX, YY = np.meshgrid(X, Y, indexing='ij')
+        dx, dy = x1 - x0, y1 - y0
+        L2 = dx * dx + dy * dy
+        t = np.clip(((XX - x0) * dx + (YY - y0) * dy) / L2, 0.0, 1.0) if L2 > 1e-9 else np.zeros_like(XX)
+        inside = np.hypot(XX - (x0 + t * dx), YY - (y0 + t * dy)) <= half_width
+        counts = (top & inside[:, :, None]).sum(axis=(0, 1))
+        zk = self.origin_z + (k0 + np.arange(len(counts)) + 0.5) * res
+        n_top = int(counts[zk >= min(z0, z1) + rise[0]].sum())
+        levels, k = [], 0
+        while k < len(counts):
+            if counts[k] >= min_cells:
+                k_end = k
+                while k_end + 1 < len(counts) and counts[k_end + 1] >= min_cells:
+                    k_end += 1
+                ks = np.arange(k, k_end + 1)
+                levels.append(self.origin_z + (k0 + float((ks * counts[ks]).sum() / counts[ks].sum()) + 0.5) * res)
+                k = k_end + 1
+            else:
+                k += 1
+        best = run = 0
+        for a, b in zip(levels, levels[1:]):
+            run = run + 1 if rise[0] <= b - a <= rise[1] else 0
+            best = max(best, run)
+        return best, n_top, levels
 
     def stair_distance(self, x, y, z_r=None, dz=1.0):
         """xy distance from (x, y) to the nearest stair voxel (inf if none is mapped); with z_r,
@@ -669,6 +881,22 @@ class VoxelMapper:
         self._touch((0, 0, 0), self.logodds.shape)
 
     # -- outputs ----------------------------------------------------------------
+    def semantic_only_at(self, flat_idx):
+        """Voxels traversable only through M_s (semantic frontiers F_s, Sec. VI-A): in M_s, not in
+        M_g, and not floor that joins M_g on the way back to mode g (set_mode merges M_s without
+        the stairs): the non-planar classes, i.e. the stairs with floor / rug / stairs."""
+        flat_idx = np.asarray(flat_idx, dtype=np.int64)
+        return (self.trav_s.reshape(-1)[flat_idx] & self.stairs.reshape(-1)[flat_idx]
+                & ~self.trav_g.reshape(-1)[flat_idx])
+
+    def traversable_at(self, flat_idx):
+        """M_trav at the given flat voxel indices (without building the whole array)."""
+        flat_idx = np.asarray(flat_idx, dtype=np.int64)
+        src = self.trav_g.reshape(-1)[flat_idx]
+        if self.mode == 's':
+            src = src | self.trav_s.reshape(-1)[flat_idx]
+        return src & ~self.inflated.reshape(-1)[flat_idx]
+
     def traversable(self):
         """M_trav = T \\ O_inf as a boolean voxel array."""
         return self._source() & ~self.inflated
@@ -762,3 +990,117 @@ class StuckDetector:
             return False
         self.reset()
         return True
+
+
+class VirtualGround:
+    """Downward-looking behaviour for descending stairs (Sec. IV-D), closed loop.
+
+    Descending stairs can lie entirely below the forward-looking view. A virtual ground plane
+    Pi_vg lies `depth` below the robot's support plane z_r. The paper gives no camera angle:
+    looking down is a behaviour triggered by the observation (more than N_down depth points below
+    Pi_vg), and its purpose is to observe what lies below Pi_vg. So the pitch here is not a set
+    angle but the result of a feedback loop on that count:
+      - trigger: more than n_down points below Pi_vg (within `radius` in xy) -> look down one step
+        (`step`, the 30 deg look_down action of the Habitat ObjectNav action space);
+      - after `settle` frames at the new pitch the count is measured again: if looking further
+        down showed clearly more below Pi_vg (more than (1 + gain) x the count one step up), go one
+        step further (up to max_pitch); if it showed less, go back one step; else stay. The pitch
+        is then held (`settled`);
+      - the held pitch is searched again (one step further down) after the robot moved
+        `rescan_move` m: a new view of what is below;
+      - release: fewer than n_down points for `hold` s -> camera level again.
+    force() starts the behaviour without the trigger (going down a staircase, where the stairs
+    are below the view by construction): at least one step down, the rest by the same loop, and
+    no release until reset().
+    Not given in the paper, chosen here:
+      - depth 0.3 m: below one step (0.15-0.2 m) and below the floor noise, so a rug edge or a
+        single step down does not count; a staircase going down or the floor of the storey below
+        (seen past the head of the stairs or through a stairwell) does.
+      - radius: only points near the robot; the void of a stairwell far away is not under it.
+      - gain 0.1, settle 3 frames, max_pitch 60 deg (two look_down actions), rescan_move 1 m.
+    """
+
+    def __init__(self, depth=0.3, radius=2.5, n_down=150, hold=3.0, step=math.radians(30.0),
+                 max_pitch=math.radians(60.0), settle=3, gain=0.1, rescan_move=1.0):
+        self.depth, self.radius = float(depth), float(radius)
+        self.n_down, self.hold = int(n_down), float(hold)
+        self.step, self.settle, self.gain = float(step), int(settle), float(gain)
+        self.max_level = max(1, int(round(float(max_pitch) / self.step))) if self.step > 0 else 0
+        self.rescan_move = float(rescan_move)
+        self.reset()
+
+    @property
+    def pitch(self):
+        """Camera pitch the behaviour asks for [rad], positive = down."""
+        return self.level * self.step if self.active else 0.0
+
+    def count(self, pts, x, y, z_r):
+        """Number of points (N x 3, map frame) below Pi_vg within radius of (x, y)."""
+        pts = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+        below = pts[:, 2] < z_r - self.depth
+        near = (pts[:, 0] - x) ** 2 + (pts[:, 1] - y) ** 2 <= self.radius ** 2
+        return int(np.count_nonzero(below & near))
+
+    def _go(self, level, n_ref):
+        """Command `level` steps down; measure again after `settle` frames against n_ref."""
+        self.level, self.n_ref, self.wait, self.settled = level, n_ref, self.settle, False
+
+    def force(self, t, xy=None):
+        """Start looking down without the trigger (descending a staircase): one step down."""
+        self.reset()
+        self.active, self.forced, self.last_seen, self.xy = True, True, t, xy
+        self._go(min(1, self.max_level), None)
+        self.decision = 'going down stairs'
+
+    def update(self, n, t, xy=None):
+        """Feed the count of one frame at time t (robot at xy); returns (active, changed).
+        self.pitch is the pitch to command, self.decision says why it last changed."""
+        was = self.active
+        if n > self.n_down:
+            self.last_seen = t
+            if not self.active:                    # trigger: look down one step
+                self.active, self.forced, self.xy = True, False, xy
+                self._go(min(1, self.max_level), n)
+                self.decision = f'{n} points below Pi_vg'
+                return True, True
+        elif self.active and not self.forced and (self.last_seen is None or t - self.last_seen >= self.hold):
+            self.reset()
+            return False, was
+        if not self.active:
+            return False, False
+        if self.wait > 0:                          # frames of the old pitch may still come in
+            self.wait -= 1
+            return True, False
+        if self.settled:
+            # (only going down stairs, or with points below: on a floor with nothing below it
+            # stepped further down after every metre, 00890)
+            if (xy is not None and self.xy is not None and self.level < self.max_level
+                    and (self.forced or n > 0)
+                    and math.hypot(xy[0] - self.xy[0], xy[1] - self.xy[1]) >= self.rescan_move):
+                self.xy = xy                       # moved: is there more below further down now?
+                self._go(self.level + 1, n)
+                self.decision = f'moved {self.rescan_move:.1f} m, {n} points below: one step further'
+            return True, False
+        lo = 1 if self.forced else 0
+        if self.n_ref is None or n > (1.0 + self.gain) * self.n_ref:
+            if self.level < self.max_level:        # looking further down showed more: go on
+                self._go(self.level + 1, n)
+                self.decision = f'{n} points below, more than one step up: one step further'
+                return True, False
+            self.decision = f'{n} points below at the lowest pitch: held'
+        elif n < self.n_ref and self.level > lo:   # showed less: one step back, held there
+            self.level -= 1
+            self.decision = f'{n} points below, {self.n_ref} one step up: one step back, held'
+        else:
+            self.decision = f'{n} points below, {self.n_ref} one step up: held'
+        self.settled = True
+        if xy is not None:
+            self.xy = xy
+        return True, False
+
+    def reset(self):
+        self.active = False
+        self.forced = False
+        self.last_seen = None            # time of the last frame with more than n_down points below
+        self.level, self.n_ref, self.wait, self.settled = 0, None, 0, False
+        self.xy, self.decision = None, None

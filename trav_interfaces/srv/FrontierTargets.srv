@@ -1,0 +1,10 @@
+# J_geo from the robot to each frontier cluster F_i of the latest graph snapshot, as the paper's
+# ATSP takes it: min over the cluster voxels C_i (they lie on M_trav, so they are graph nodes) of
+# the path cost on the support graph, and v_target, the voxel where it is reached
+# (voxel_mapper_node, trav3d.SupportGraph).
+geometry_msgs/Point source
+---
+int64[] ids                     # frontier cluster ids (frontier3d, as in voxel_map/frontier_clusters)
+float64[] costs                 # inf: no voxel of the cluster reachable from the source
+geometry_msgs/Point[] targets   # v_target per cluster (its centroid when unreachable)
+bool ok                         # false: no map / graph yet
