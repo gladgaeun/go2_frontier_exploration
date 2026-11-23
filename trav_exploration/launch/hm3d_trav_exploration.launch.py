@@ -65,7 +65,7 @@ def generate_launch_description():
         DeclareLaunchArgument('instance_min_confidence', default_value='0.5'),
         DeclareLaunchArgument('instance_min_count', default_value='60',
                               description='evidence points (0.1 m voxels) before an object cluster is a target'),
-        DeclareLaunchArgument('instance_min_detections', default_value='5',
+        DeclareLaunchArgument('instance_min_detections', default_value='4',
                               description='frames with a detection before a cluster is a target'),
         DeclareLaunchArgument('debug_dump_dir', default_value='',
                               description='save the voxel map around every climb stop here (diagnostics)'),
