@@ -327,7 +327,7 @@ class FrontierGoalNode(Node):
         # record_dir: periodic state for offline datasets (recorder.py; '' = off)
         self.recorder = Recorder(self, 'frontier_goal', str(p('record_dir', '').value))
         if self.recorder:
-            self.create_timer(float(p('record_period', 5.0).value), self._record_state,
+            self.create_timer(float(p('record_period', 1.0).value), self._record_state,
                               callback_group=MutuallyExclusiveCallbackGroup())
         self.get_logger().info(f'frontier goals from voxel_map/frontier_clusters, order {self.goal_order}, '
                                f'goal_clearance {self.goal_clearance} m')
@@ -534,16 +534,23 @@ class FrontierGoalNode(Node):
         return (float(ring[k, 0]), float(ring[k, 1]), True), i, float(J[k])
 
     def _record_state(self):
-        """Exploration state for offline datasets: robot, floors, frontier clusters, stair
-        landmarks with J_geo from the robot to their entrance, reliable targets."""
+        """Exploration state for offline datasets (every record_period s)."""
+        try:
+            self.recorder.record('state', **self._state_fields())
+        except Exception as e:                 # noqa: BLE001 (a record never takes the node down)
+            self.get_logger().warn(f'[record] state not written: {e!r}', throttle_duration_sec=30.0)
+
+    def _state_fields(self):
+        """Robot, floors, frontier clusters, stair landmarks with J_geo from the robot to their
+        entrance, reliable targets, the last goal and whether a target is tracked."""
         try:
             rx, ry = self._robot_xy()
         except Exception:                                   # noqa: BLE001 (no TF yet)
-            return
+            rx, ry = None, None
         z = self.z_r
         lms = list(self.landmarks)
         J = None
-        if lms and z is not None:
+        if lms and z is not None and rx is not None:
             ent = [(lm[0], lm[1], lm[2]) for lm in lms]
             J = self._geo_costs([(rx, ry, z)], ent)
         targets = {}
@@ -553,8 +560,11 @@ class FrontierGoalNode(Node):
                 targets[int(i)] = dict(gamma=float(g), n=len(pts), zmin=float(pts[:, 2].min()),
                                        z10=float(np.percentile(pts[:, 2], 10)),
                                        centroid=pts.mean(axis=0).round(3))
-        self.recorder.record(
-            'state', robot=[rx, ry], z_r=z, explored_floors=list(self.explored_floors),
+        last = getattr(self, 'last_goal', None)
+        return dict(
+            robot=[rx, ry], z_r=z, explored_floors=list(self.explored_floors),
+            tracking_target=bool(getattr(self, 'tracking_target', False)) and not self.target_found,
+            goal_kind=None if last is None else last[0], goal=None if last is None else last[1],
             climbed=[list(c) for c in self.climbed], target=self.target, target_found=bool(self.target_found),
             serving=bool(self.serving), pursuing_frontier=self.pursued is not None,
             clusters=[list(c) for c in self.clusters], floor_band=self.floor_band,
@@ -1139,6 +1149,7 @@ class FrontierGoalNode(Node):
         returns None (no goal: the explorer asks again on the new floor). Sending the entrance as
         a Nav2 goal instead failed: the 2-D explorer then blacklisted reached goals, and
         meanwhile new frontiers took the robot away again."""
+        self.goal_kind = 'stairs'
         def allowed(c):
             return c[1] == want_dir if want_dir is not None else not self._floor_explored(c[1])
         cands = [c for c in self._stair_candidates() if allowed(c)]
@@ -1309,10 +1320,32 @@ class FrontierGoalNode(Node):
 
     def _on_request(self, request, response):
         self.serving = True
+        self.goal_kind = None                  # set to 'target' / 'stairs' on those branches
+        t_req = time.time()
         try:
-            return self._answer(request, response)
+            response = self._answer(request, response)
+            return response
         finally:
             self.serving = False
+            pose = response.goal_pose
+            sent = pose.header.frame_id != ''
+            if request.goal_rank == 0 or sent or self.goal_kind:
+                # the goal the robot goes to now: rank 0, or a later rank the explorer took
+                # because rank 0 had no path
+                kind = self.goal_kind or ('frontier' if sent else 'none')
+                # tracking: the last answer sent a reliable target (O_tar); a demoted target
+                # (frontier goal again) or the end of the exploration clears it
+                self.tracking_target = kind == 'target'
+                self.last_goal = (kind, (pose.pose.position.x, pose.pose.position.y) if sent else None)
+            if self.recorder:
+                try:                           # a record never takes the planner down
+                    self.recorder.record(
+                        'request', rank=int(request.goal_rank),
+                        answer_kind=self.goal_kind or ('frontier' if sent else 'none'),
+                        answer_goal=[pose.pose.position.x, pose.pose.position.y] if sent else None,
+                        answer_wall_s=round(time.time() - t_req, 3), **self._state_fields())
+                except Exception as e:         # noqa: BLE001
+                    self.get_logger().warn(f'[record] request not written: {e!r}', throttle_duration_sec=30.0)
 
     def _answer(self, request, response):
         self.get_logger().info(f'Received request, {request.goal_rank}')
@@ -1361,6 +1394,7 @@ class FrontierGoalNode(Node):
                 self.plan.pop('sent', None)
                 self.pursued = None                    # the target goal is not a frontier
                 self._publish_target_goal(gx, gy)
+                self.goal_kind = 'target'
                 pose.header.frame_id = self.map_frame
                 pose.pose.position.x, pose.pose.position.y = gx, gy
                 response.goal_pose = pose

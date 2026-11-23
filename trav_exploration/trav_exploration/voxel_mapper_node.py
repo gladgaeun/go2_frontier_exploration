@@ -451,7 +451,7 @@ class VoxelMapperNode(Node):
         self.debug_dump_dir = str(p('debug_dump_dir', '').value)
         # record_dir: periodic state for offline datasets (recorder.py; '' = off)
         self.recorder = Recorder(self, 'voxel_mapper', str(p('record_dir', '').value))
-        self.record_period = float(p('record_period', 5.0).value)    # s of sim time
+        self.record_period = float(p('record_period', 1.0).value)    # s of sim time
         self.last_record = -1e9
         self.n_dump = 0
         self.graph = None
@@ -719,12 +719,25 @@ class VoxelMapperNode(Node):
         m = self.mapper
         per_layer = m._source().sum(axis=(0, 1))
         stairs_layer = m.stairs.sum(axis=(0, 1))
+        # value map (Sec. V-B) per voxel layer: max and mean of the fused score s over the voxels
+        # with a value (keys are flat indices of the voxel map: layer = key % nz)
+        v_max = np.zeros(m.nz)
+        v_mean = np.zeros(m.nz)
+        v_n = np.zeros(m.nz, dtype=int)
+        keys, sv = self.value.keys, self.value.s
+        if len(keys) and len(keys) == len(sv):
+            lay = keys % m.nz
+            v_n = np.bincount(lay, minlength=m.nz)
+            v_mean = np.bincount(lay, weights=sv, minlength=m.nz) / np.maximum(v_n, 1)
+            np.maximum.at(v_max, lay, sv)
         self.recorder.record(
             'state', base=[float(v) for v in base_p], support_z=self.support_z, floor_z=self.floor_z,
             floor_anchor=self.floor_anchor, climbing=bool(self.climbing),
             climb_dir=int(getattr(self, 'climb_dir', 0)) if self.climbing else 0, mode=m.mode,
             on_stairs=bool(on_stairs), origin_z=float(m.origin_z), res=float(m.res),
-            trav_cells_per_layer=per_layer.astype(int), stair_cells_per_layer=stairs_layer.astype(int))
+            trav_cells_per_layer=per_layer.astype(int), stair_cells_per_layer=stairs_layer.astype(int),
+            value_max_per_layer=v_max.round(4), value_mean_per_layer=v_mean.round(4),
+            value_voxels_per_layer=v_n.astype(int))
 
     def _min_d_obs(self):
         res = self.mapper.res if self.mapper is not None else 0.05
@@ -1692,7 +1705,10 @@ class VoxelMapperNode(Node):
                                           update_g=self.mapper.mode == 'g' or not on_stairs)
         if self.recorder and now - self.last_record >= self.record_period:
             self.last_record = now
-            self._record_state(base_p, on_stairs)
+            try:                                       # a record never takes the map down
+                self._record_state(base_p, on_stairs)
+            except Exception as e:                     # noqa: BLE001
+                self.get_logger().warn(f'[record] state not written: {e!r}', throttle_duration_sec=30.0)
         if self.geo_treads and self.climbing and self.mapper.mode == 's' and self.frames % 3 == 0:
             # treads of the turn that SAM3 left unlabelled: by step geometry (VoxelMapper.geometric_treads)
             going_up = getattr(self, 'climb_dir', 1) > 0
