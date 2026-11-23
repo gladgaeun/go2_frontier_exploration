@@ -197,7 +197,9 @@ class FrontierGoalNode(Node):
         # clusters are unobserved, up to look_max_pitch; it stops when they are observed
         self.look_max_pitch = float(p('look_max_pitch', math.radians(60.0)).value)
         self.looked = []              # centroids of the blind-spot frontiers already looked at
-        self.pitch_pub = self.create_publisher(Float64, 'camera/pitch_cmd', 1)
+        # the blind-spot look-down as a request: voxel_mapper_node owns camera/pitch_cmd and sends
+        # the largest of its own pitch and this one (two owners nodded the camera)
+        self.pitch_pub = self.create_publisher(Float64, 'camera/pitch_request', 1)
         self.look_around = bool(p('look_around', True).value)
         self.look_around_speed = float(p('look_around_speed', 0.6).value)    # rad/s
         self.need_look_around = self.look_around
