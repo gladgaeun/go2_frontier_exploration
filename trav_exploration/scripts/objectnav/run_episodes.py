@@ -144,7 +144,8 @@ def run_episode(ep, args, d):
     launch_args = (f"rviz:={'true' if args.rviz else 'false'} segmentation:=sam3 {target} "
                    f"zmq_address:={args.habitat_address} sam3_address:={args.sam3_address} "
                    f"blip2_address:={args.blip2_address} explore_restarts:={args.explore_restarts} "
-                   f"map_z_below:={ep['map_z_below']} map_z_above:={ep['map_z_above']} {args.launch_args}")
+                   f"map_z_below:={ep['map_z_below']} map_z_above:={ep['map_z_above']} "
+                   + (f"record_dir:={os.path.join(d, 'record')} " if args.record else '') + args.launch_args)
     env = dict(os.environ, RMW_IMPLEMENTATION='rmw_cyclonedds_cpp', ROS_DOMAIN_ID=str(args.domain_id),
                PYTHONUNBUFFERED='1')
     launch = subprocess.Popen(ros_cmd(f'ros2 launch trav_exploration hm3d_trav_exploration.launch.py {launch_args}'),
@@ -244,6 +245,9 @@ def main():
     p.add_argument('--domain-id', type=int, default=57, help='ROS_DOMAIN_ID (keeps other ROS sessions apart)')
     p.add_argument('--rviz', action='store_true')
     p.add_argument('--launch-args', default='', help='extra launch arguments')
+    p.add_argument('--record', action='store_true',
+                   help='state records of voxel_mapper / frontier_goal / instance_map in <episode>/record '
+                        '(offline datasets, recorder.py)')
     args = p.parse_args()
 
     eps = json.load(open(os.path.expanduser(args.episodes)))

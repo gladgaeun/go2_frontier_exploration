@@ -85,6 +85,7 @@ from trav_exploration import trav3d
 from trav_exploration.semantic import ModeSwitch, split_classes
 from trav_exploration.voxel_mapper import StuckDetector, VirtualGround, VoxelMapper, start_support
 from trav_exploration.tour import cost_matrix, solve_open_atsp
+from trav_exploration.recorder import Recorder
 from trav_exploration.value_map import ValueMap, view_weight
 from trav_interfaces.msg import ImageScore
 from trav_interfaces.srv import FrontierTargets, GeoCosts, TargetGoal
@@ -439,6 +440,10 @@ class VoxelMapperNode(Node):
         # diagnostics: when a climb ends with nothing reachable, save the map around the robot
         # (occupancy, M_g, M_s, stairs, O_inf, M_trav) to <dir>/climb_stop_<n>.npz ('' = off)
         self.debug_dump_dir = str(p('debug_dump_dir', '').value)
+        # record_dir: periodic state for offline datasets (recorder.py; '' = off)
+        self.recorder = Recorder(self, 'voxel_mapper', str(p('record_dir', '').value))
+        self.record_period = float(p('record_period', 5.0).value)    # s of sim time
+        self.last_record = -1e9
         self.n_dump = 0
         self.graph = None
         self.graph_of = None
@@ -698,6 +703,19 @@ class VoxelMapperNode(Node):
             f'vs {n_old} within {self.floor_reanchor_radius:.0f} m)')
         self.floor_z = self.floor_anchor = self.support_z
         self.reanchor_cand = None
+
+    def _record_state(self, base_p, on_stairs):
+        """Floor state for offline datasets: the support, the floor the map works on, and the
+        traversable source T per voxel layer (cells; floors and their areas are read from it)."""
+        m = self.mapper
+        per_layer = m._source().sum(axis=(0, 1))
+        stairs_layer = m.stairs.sum(axis=(0, 1))
+        self.recorder.record(
+            'state', base=[float(v) for v in base_p], support_z=self.support_z, floor_z=self.floor_z,
+            floor_anchor=self.floor_anchor, climbing=bool(self.climbing),
+            climb_dir=int(getattr(self, 'climb_dir', 0)) if self.climbing else 0, mode=m.mode,
+            on_stairs=bool(on_stairs), origin_z=float(m.origin_z), res=float(m.res),
+            trav_cells_per_layer=per_layer.astype(int), stair_cells_per_layer=stairs_layer.astype(int))
 
     def _min_d_obs(self):
         res = self.mapper.res if self.mapper is not None else 0.05
@@ -1652,6 +1670,9 @@ class VoxelMapperNode(Node):
         self._virtual_ground(pts[hit], base_p, now)
         n_changed = self.mapper.integrate(cam_p, pts, hit, support,
                                           update_g=self.mapper.mode == 'g' or not on_stairs)
+        if self.recorder and now - self.last_record >= self.record_period:
+            self.last_record = now
+            self._record_state(base_p, on_stairs)
         if self.geo_treads and self.climbing and self.mapper.mode == 's' and self.frames % 3 == 0:
             # treads of the turn that SAM3 left unlabelled: by step geometry (VoxelMapper.geometric_treads)
             going_up = getattr(self, 'climb_dir', 1) > 0

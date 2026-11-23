@@ -121,11 +121,14 @@ def main():
                         'start floor: 2 of 1000 in val); cross: new episodes that start on a floor without '
                         'any object of the category, scored with the dataset goals and view points')
     p.add_argument('--limit', type=int, default=0, help='keep the first N episodes after interleaving the scenes')
+    p.add_argument('--min-levels', type=int, default=1,
+                   help='only scenes whose navmesh has at least this many floors (2: multi-floor scenes)')
+    p.add_argument('--split', default='val', help='dataset split of the default --episodes-dir (val / train)')
     p.add_argument('--seed', type=int, default=0)
     args = p.parse_args()
 
     if not args.episodes_dir:
-        args.episodes_dir = f'{home}/data/datasets/objectnav/hm3d/unz/objectnav_hm3d_{args.dataset}/val/content'
+        args.episodes_dir = f'{home}/data/datasets/objectnav/hm3d/unz/objectnav_hm3d_{args.dataset}/{args.split}/content'
     import habitat_sim
     want = [s.strip() for s in args.scenes.split(',') if s.strip()]
     cats = [c.strip() for c in args.categories.split(',') if c.strip()]
@@ -147,6 +150,9 @@ def main():
         pf = habitat_sim.PathFinder()
         pf.load_nav_mesh(nav)
         lv = levels(pf)
+        if len(lv) < args.min_levels:
+            print(f'skip {scene_dir}: {len(lv)} floor(s)')
+            continue
         goals = {}
         for key, objs in d['goals_by_category'].items():
             cat = key[len(os.path.basename(rel)) + 1:]
