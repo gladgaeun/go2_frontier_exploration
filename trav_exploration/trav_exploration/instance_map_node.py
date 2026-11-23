@@ -39,6 +39,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 
 from trav_exploration.instance_map import InstanceMap
+from trav_exploration.recorder import Recorder
 from trav_interfaces.msg import Detections
 
 
@@ -115,8 +116,26 @@ class InstanceMapNode(Node):
         self.marker_pub = self.create_publisher(MarkerArray, 'instance_map/markers', 1)
         self.points_pub = self.create_publisher(PointCloud2, 'instance_map/points', 1)
         self.det_cloud_pub = self.create_publisher(PointCloud2, 'instance_map/detections', 1)
+        # record_dir: periodic state for offline datasets (recorder.py; '' = off)
+        self.recorder = Recorder(self, 'instance_map', str(p('record_dir', '').value))
+        if self.recorder:
+            self.create_timer(float(p('record_period', 5.0).value), self._record_state)
         self.get_logger().info(f'instance map: landmarks {self.landmark_queries}, objects {self.object_queries}, '
                                f'min confidence {self.map.min_conf}')
+
+    def _record_state(self):
+        """Every instance (reliable or tentative) for offline datasets."""
+        with self.lock:
+            out = []
+            for inst in self.map.instances:
+                pts = self.map.points(inst.keys)
+                if not len(pts):
+                    continue
+                out.append(dict(id=int(inst.id), label=inst.label, gamma=round(inst.gamma, 4), n=int(inst.n),
+                                n_pos=int(inst.n_pos), n_neg=int(inst.n_neg), reliable=bool(self._usable(inst)),
+                                centroid=pts.mean(axis=0).round(3), zmin=float(pts[:, 2].min()),
+                                z10=float(np.percentile(pts[:, 2], 10)), zmax=float(pts[:, 2].max())))
+        self.recorder.record('instances', instances=out)
 
     # -- inputs -----------------------------------------------------------------------------
     def _on_info(self, msg):

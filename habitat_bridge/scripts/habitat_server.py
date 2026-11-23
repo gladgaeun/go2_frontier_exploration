@@ -611,7 +611,7 @@ def parse_args(argv=None):
                         'finds hm3d_annotated_*scene_dataset_config.json above the scene if '
                         '--dataset-config is not given)')
     p.add_argument('--trajectory', default='',
-                   help='write the agent pose (habitat "t x y z yaw", sim time) to this file every '
+                   help='write the agent pose (habitat "t x y z yaw pitch", sim time) to this file every '
                         '--trajectory-period s of sim time and at the end (ObjectNav evaluation)')
     p.add_argument('--trajectory-period', type=float, default=0.2)
     p.add_argument('--max-lin-vel', type=float, default=1.0)
@@ -647,7 +647,9 @@ def main():
         pos = robot.node.translation
         fwd = robot.node.rotation.transform_vector(robot.mn.Vector3(0.0, 0.0, -1.0))
         yaw = math.atan2(-fwd[0], -fwd[2])                      # habitat yaw about +y
-        traj.write(f'{robot.sim_time:.3f} {pos[0]:.4f} {pos[1]:.4f} {pos[2]:.4f} {yaw:.4f}\n')
+        # t x y z yaw camera_pitch (rad, negative = down): the views can be rendered again offline
+        traj.write(f'{robot.sim_time:.3f} {pos[0]:.4f} {pos[1]:.4f} {pos[2]:.4f} {yaw:.4f} '
+                   f'{robot.camera_pitch:.4f}\n')
     while running:
         if not poller.poll(200):
             continue

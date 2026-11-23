@@ -120,6 +120,7 @@ from trav_exploration.goal_selection import (clear_cells, is_reachable, pull_bac
                                              select_frontier, snap_to_clear_cell)
 from trav_exploration.tour import cost_matrix, geo_costs, nearest_node, solve_open_atsp, step_graph
 from trav_exploration.value_map import utilities
+from trav_exploration.recorder import Recorder
 from action_msgs.srv import CancelGoal
 from trav_interfaces.srv import FrontierTargets, GeoCosts, TargetGoal
 
@@ -196,7 +197,9 @@ class FrontierGoalNode(Node):
         # clusters are unobserved, up to look_max_pitch; it stops when they are observed
         self.look_max_pitch = float(p('look_max_pitch', math.radians(60.0)).value)
         self.looked = []              # centroids of the blind-spot frontiers already looked at
-        self.pitch_pub = self.create_publisher(Float64, 'camera/pitch_cmd', 1)
+        # the blind-spot look-down as a request: voxel_mapper_node owns camera/pitch_cmd and sends
+        # the largest of its own pitch and this one (two owners nodded the camera)
+        self.pitch_pub = self.create_publisher(Float64, 'camera/pitch_request', 1)
         self.look_around = bool(p('look_around', True).value)
         self.look_around_speed = float(p('look_around_speed', 0.6).value)    # rad/s
         self.need_look_around = self.look_around
@@ -320,6 +323,11 @@ class FrontierGoalNode(Node):
         self.create_timer(1.0, self._publish_unreachable, callback_group=inputs)
         if self.target and self.target_preempt_period > 0.0:
             self.create_timer(self.target_preempt_period, self._preempt_for_target,
+                              callback_group=MutuallyExclusiveCallbackGroup())
+        # record_dir: periodic state for offline datasets (recorder.py; '' = off)
+        self.recorder = Recorder(self, 'frontier_goal', str(p('record_dir', '').value))
+        if self.recorder:
+            self.create_timer(float(p('record_period', 5.0).value), self._record_state,
                               callback_group=MutuallyExclusiveCallbackGroup())
         self.get_logger().info(f'frontier goals from voxel_map/frontier_clusters, order {self.goal_order}, '
                                f'goal_clearance {self.goal_clearance} m')
@@ -524,6 +532,34 @@ class FrontierGoalNode(Node):
             return None
         self._target_skipped(i, '')
         return (float(ring[k, 0]), float(ring[k, 1]), True), i, float(J[k])
+
+    def _record_state(self):
+        """Exploration state for offline datasets: robot, floors, frontier clusters, stair
+        landmarks with J_geo from the robot to their entrance, reliable targets."""
+        try:
+            rx, ry = self._robot_xy()
+        except Exception:                                   # noqa: BLE001 (no TF yet)
+            return
+        z = self.z_r
+        lms = list(self.landmarks)
+        J = None
+        if lms and z is not None:
+            ent = [(lm[0], lm[1], lm[2]) for lm in lms]
+            J = self._geo_costs([(rx, ry, z)], ent)
+        targets = {}
+        for i, (g, pts) in list(self.targets.items()):
+            pts = np.asarray(pts)
+            if len(pts):
+                targets[int(i)] = dict(gamma=float(g), n=len(pts), zmin=float(pts[:, 2].min()),
+                                       z10=float(np.percentile(pts[:, 2], 10)),
+                                       centroid=pts.mean(axis=0).round(3))
+        self.recorder.record(
+            'state', robot=[rx, ry], z_r=z, explored_floors=list(self.explored_floors),
+            climbed=[list(c) for c in self.climbed], target=self.target, target_found=bool(self.target_found),
+            serving=bool(self.serving), pursuing_frontier=self.pursued is not None,
+            clusters=[list(c) for c in self.clusters], floor_band=self.floor_band,
+            landmarks=[list(lm) for lm in lms],
+            landmark_J=None if J is None else [float(v) for v in J[0]], targets=targets)
 
     def _on_climb_state(self, msg):
         if msg.data.startswith('done'):

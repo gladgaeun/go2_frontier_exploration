@@ -85,6 +85,7 @@ from trav_exploration import trav3d
 from trav_exploration.semantic import ModeSwitch, split_classes
 from trav_exploration.voxel_mapper import StuckDetector, VirtualGround, VoxelMapper, start_support
 from trav_exploration.tour import cost_matrix, solve_open_atsp
+from trav_exploration.recorder import Recorder
 from trav_exploration.value_map import ValueMap, view_weight
 from trav_interfaces.msg import ImageScore
 from trav_interfaces.srv import FrontierTargets, GeoCosts, TargetGoal
@@ -349,6 +350,15 @@ class VoxelMapperNode(Node):
         # many steps the camera goes down is decided by the Pi_vg feedback loop (VirtualGround)
         self.descend_pitch = float(p('descend_pitch', math.radians(30.0)).value)
         self.pitch_pub = self.create_publisher(Float64, 'camera/pitch_cmd', 1)
+        # one owner of the camera pitch: this node sends max over its parts (Pi_vg, the start
+        # look-down, the climb look-down, the fixed descent pitch) and frontier_goal_node's request
+        # (camera/pitch_request, the blind-spot look-down). Two nodes commanding camera/pitch_cmd
+        # each in turn nodded the camera every 0.5 s (00035: 31 changes in 6 min, 60-15-60-30-45...)
+        self.pitch_parts = {}
+        self.cmd_pitch = 0.0
+        self.create_subscription(Float64, 'camera/pitch_request',
+                                 lambda m: self._command_pitch('request', float(m.data)), 10,
+                                 callback_group=self.requests_group)
         self.stuck_pub = self.create_publisher(Empty, 'voxel_map/stuck', 10)   # after the map update
         self.climb_dir = 1
         # virtual ground plane Pi_vg (Sec. IV-D): more than vg_n_down depth points below it near
@@ -439,6 +449,10 @@ class VoxelMapperNode(Node):
         # diagnostics: when a climb ends with nothing reachable, save the map around the robot
         # (occupancy, M_g, M_s, stairs, O_inf, M_trav) to <dir>/climb_stop_<n>.npz ('' = off)
         self.debug_dump_dir = str(p('debug_dump_dir', '').value)
+        # record_dir: periodic state for offline datasets (recorder.py; '' = off)
+        self.recorder = Recorder(self, 'voxel_mapper', str(p('record_dir', '').value))
+        self.record_period = float(p('record_period', 5.0).value)    # s of sim time
+        self.last_record = -1e9
         self.n_dump = 0
         self.graph = None
         self.graph_of = None
@@ -699,6 +713,19 @@ class VoxelMapperNode(Node):
         self.floor_z = self.floor_anchor = self.support_z
         self.reanchor_cand = None
 
+    def _record_state(self, base_p, on_stairs):
+        """Floor state for offline datasets: the support, the floor the map works on, and the
+        traversable source T per voxel layer (cells; floors and their areas are read from it)."""
+        m = self.mapper
+        per_layer = m._source().sum(axis=(0, 1))
+        stairs_layer = m.stairs.sum(axis=(0, 1))
+        self.recorder.record(
+            'state', base=[float(v) for v in base_p], support_z=self.support_z, floor_z=self.floor_z,
+            floor_anchor=self.floor_anchor, climbing=bool(self.climbing),
+            climb_dir=int(getattr(self, 'climb_dir', 0)) if self.climbing else 0, mode=m.mode,
+            on_stairs=bool(on_stairs), origin_z=float(m.origin_z), res=float(m.res),
+            trav_cells_per_layer=per_layer.astype(int), stair_cells_per_layer=stairs_layer.astype(int))
+
     def _min_d_obs(self):
         res = self.mapper.res if self.mapper is not None else 0.05
         return self.mapper_args['robot_radius'] + math.ceil(self.goal_clearance / res - 1e-9) * res + 1e-6
@@ -773,7 +800,7 @@ class VoxelMapperNode(Node):
             self.vg.reset()
             self._publish_vg_pitch('[Pi_vg] climb up')
         elif direction < 0 and self.descend_pitch > 0.0:
-            self.pitch_pub.publish(Float64(data=self.descend_pitch))   # no Pi_vg: one fixed step
+            self._command_pitch('descend', self.descend_pitch)           # no Pi_vg: one fixed step
         self._take_snapshot()                      # the graph of mode s, with the stairs
         self.get_logger().info('[climb] started' + (' (down)' if direction < 0 else ''))
         self.climb_state_pub.publish(String(data='climbing'))
@@ -883,7 +910,8 @@ class VoxelMapperNode(Node):
             if self.vg is not None:                # the trigger decides again from here on
                 self.vg.reset()
             self.vg_pitch = 0.0
-            self.pitch_pub.publish(Float64(data=0.0))
+            self._command_pitch('vg', 0.0)
+            self._command_pitch('descend', 0.0)
         # still on the stairs (a landing half-way): not a new floor (00800 with SAM3: the descent
         # stopped at -1.61 m, which was then explored as a floor)
         # (standing on a stair voxel: a robot at the stair head of the new floor is near the top
@@ -897,6 +925,17 @@ class VoxelMapperNode(Node):
         self.climb_state_pub.publish(String(data=f'done {self.support_z:.3f}' + (' stairs' if on else '')
                                             + (' turned' if turned else '') + (' cancelled' if cancelled else '')))
 
+    def _command_pitch(self, part, pitch):
+        """Set one part of the camera pitch and send the largest of them (rad, + = down)."""
+        self.pitch_parts[part] = max(0.0, float(pitch))
+        p = max(self.pitch_parts.values())
+        if abs(p - self.cmd_pitch) > 1e-6:
+            others = {k: round(math.degrees(v)) for k, v in self.pitch_parts.items() if v > 0.0}
+            self.get_logger().info(f'[pitch] camera {math.degrees(self.cmd_pitch):.0f} -> {math.degrees(p):.0f} '
+                                   f'deg down (parts {others or "none"})')
+        self.cmd_pitch = p
+        self.pitch_pub.publish(Float64(data=p))
+
     def _publish_vg_pitch(self, what):
         """Command the pitch of the downward-looking behaviour; log when it changes."""
         # never above the look-down of a start on a landing (start_pitch): Pi_vg levelled the
@@ -907,7 +946,7 @@ class VoxelMapperNode(Node):
                                    f'{math.degrees(pitch):.0f} deg down'
                                    + (f' ({self.vg.decision})' if self.vg.decision else ''))
         self.vg_pitch = pitch
-        self.pitch_pub.publish(Float64(data=pitch))
+        self._command_pitch('vg', pitch)
 
     def _vg_force_at_stairs(self, base_p, t):
         """Going down: force Pi_vg once the robot is at the stair cluster (see _start_climb)."""
@@ -1217,7 +1256,7 @@ class VoxelMapperNode(Node):
             self.get_logger().info(f'{what}: camera {math.degrees(self.climb_pitch):.0f} -> '
                                    f'{math.degrees(pitch):.0f} deg down')
         self.climb_pitch = pitch
-        self.pitch_pub.publish(Float64(data=pitch))
+        self._command_pitch('climb', pitch)
 
     def _climb_level(self):
         """Camera level again after the look-down of an upward climb (going down, Pi_vg owns it)."""
@@ -1547,14 +1586,13 @@ class VoxelMapperNode(Node):
                 self.start_look = (base_p[0], base_p[1], now)
                 if abs(self.start_pitch - self.start_look_min) > 1e-6:
                     self.start_pitch = self.start_look_min
-                    self.pitch_pub.publish(Float64(data=self.start_pitch))
+                    self._command_pitch('start', self.start_pitch)
                 self.get_logger().info(f'[start] on a landing: looking around with the camera '
                                        f'{math.degrees(self.start_pitch):.0f} deg down')
             sx, sy, st = self.start_look
             if math.hypot(base_p[0] - sx, base_p[1] - sy) >= self.start_look_move or now - st >= self.start_look_hold:
                 self.start_pitch = 0.0
-                if not self.climbing:
-                    self.pitch_pub.publish(Float64(data=0.0))
+                self._command_pitch('start', 0.0)
                 self.get_logger().info('[start] camera level again')
         if self.support_z is None or self.track_floor:
             first = self.support_z is None
@@ -1590,7 +1628,7 @@ class VoxelMapperNode(Node):
                                                f'{math.degrees(getattr(self, "start_pitch", 0.0)):.0f} -> '
                                                f'{math.degrees(pitch):.0f} deg down')
                         self.start_pitch = pitch
-                        self.pitch_pub.publish(Float64(data=pitch))
+                        self._command_pitch('start', pitch)
                 if now - w0 >= self.floor_wait:
                     self.support_z = cam_p[2] - self.camera_height
                     self.get_logger().warn(f'no level floor in view for {self.floor_wait:.0f} s (on the stairs?): '
@@ -1652,6 +1690,9 @@ class VoxelMapperNode(Node):
         self._virtual_ground(pts[hit], base_p, now)
         n_changed = self.mapper.integrate(cam_p, pts, hit, support,
                                           update_g=self.mapper.mode == 'g' or not on_stairs)
+        if self.recorder and now - self.last_record >= self.record_period:
+            self.last_record = now
+            self._record_state(base_p, on_stairs)
         if self.geo_treads and self.climbing and self.mapper.mode == 's' and self.frames % 3 == 0:
             # treads of the turn that SAM3 left unlabelled: by step geometry (VoxelMapper.geometric_treads)
             going_up = getattr(self, 'climb_dir', 1) > 0

@@ -65,10 +65,13 @@ def generate_launch_description():
         DeclareLaunchArgument('instance_min_confidence', default_value='0.5'),
         DeclareLaunchArgument('instance_min_count', default_value='60',
                               description='evidence points (0.1 m voxels) before an object cluster is a target'),
-        DeclareLaunchArgument('instance_min_detections', default_value='5',
+        DeclareLaunchArgument('instance_min_detections', default_value='4',
                               description='frames with a detection before a cluster is a target'),
         DeclareLaunchArgument('debug_dump_dir', default_value='',
                               description='save the voxel map around every climb stop here (diagnostics)'),
+        DeclareLaunchArgument('record_dir', default_value='',
+                              description='periodic state of voxel_mapper / frontier_goal / instance_map as '
+                                          'JSON Lines here (offline datasets; empty = off)'),
         DeclareLaunchArgument('stair_landmarks', default_value='auto', choices=['auto', 'instance', 'voxel'],
                               description="O_stair: 'instance' = stair clusters of the instance map (sam3), 'voxel' = "
                                           "connected stair voxels (before the instance map); 'auto' = instance with sam3"),
@@ -149,7 +152,8 @@ def generate_launch_description():
                      # path_only = the paper's stuck handling: v_front only, no 2-D narrow-gap closing
                      'stuck_close_tight': ParameterValue(PythonExpression(
                          ["'", LaunchConfiguration('guard_mode'), "' != 'path_only'"]), value_type=bool),
-                     'debug_dump_dir': LaunchConfiguration('debug_dump_dir')}])
+                     'debug_dump_dir': LaunchConfiguration('debug_dump_dir'),
+                     'record_dir': LaunchConfiguration('record_dir')}])
 
     # SAM3 segmentation (start sam3_server.py in the sam3 conda env first): the class image of the
     # semantic mode, and the detections of the instance map's queries (stairs, the target)
@@ -170,7 +174,8 @@ def generate_launch_description():
                      'max_range': 5.0,
                      'min_confidence': ParameterValue(LaunchConfiguration('instance_min_confidence'), value_type=float),
                      'min_count': ParameterValue(LaunchConfiguration('instance_min_count'), value_type=int),
-                     'min_detections': ParameterValue(LaunchConfiguration('instance_min_detections'), value_type=int)}])
+                     'min_detections': ParameterValue(LaunchConfiguration('instance_min_detections'), value_type=int),
+                     'record_dir': LaunchConfiguration('record_dir')}])
     # spatial value map (Sec. V-B): BLIP-2 image-text relevance of the target (start blip2_server.py
     # in the blip2 conda env first); only with a target
     itm = Node(
@@ -192,6 +197,7 @@ def generate_launch_description():
                          ["3.0 if '", LaunchConfiguration('value_map'), "'.lower() == 'true' else 0.0"]),
                          value_type=float),
                      'stair_landmark_topic': 'voxel_map/stair_landmarks_checked',
+                     'record_dir': LaunchConfiguration('record_dir'),
                      'inflation_radius': ParameterValue(LaunchConfiguration('inflation_radius'), value_type=float)}])     # = voxel_mapper robot_radius (d_obs in eq. 16)
 
     # Nav2 as in nav2_bringup navigation_launch.py, without the planner_server: the global path
