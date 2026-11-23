@@ -35,6 +35,7 @@ from tf2_ros.transform_listener import TransformListener
 
 from frontier_exploration.robot_navigator import BasicNavigator, NavigationResult
 from frontier_interfaces.srv import FrontierGoal
+from trav_exploration.recorder import Recorder
 
 
 class ExploreExecutor(Node):
@@ -50,6 +51,8 @@ class ExploreExecutor(Node):
         self.max_rank = int(p('max_rank', 20).value)
         self.empty_retries = int(p('empty_retries', 5).value)                 # rank 0 empty: wait 1 s, ask again
 
+        # record_dir: goal and result events for offline datasets (recorder.py; '' = off)
+        self.recorder = Recorder(self, 'explore_executor', str(p('record_dir', '').value))
         self.cli = self.create_client(FrontierGoal, 'frontier_pose')
         while not self.cli.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('frontier_pose not available, waiting again...')
@@ -127,11 +130,15 @@ class ExploreExecutor(Node):
             time.sleep(0.5)
             goal = self._next_goal()
             if goal is None:
+                self.recorder.record('end', reason='no goal')
                 self.get_logger().info('Exploration complete! No frontiers detected.')
                 return 0
             self.navigator.goToPose(goal)
+            t_goal = time.time()
+            self.recorder.record('goal', x=goal.pose.position.x, y=goal.pose.position.y)
             time.sleep(0.5)                               # Nav2 accepts the goal
             i = 0
+            timed_out = False
             while not self.navigator.isNavComplete():
                 i += 1
                 fb = self.navigator.getFeedback()
@@ -140,9 +147,15 @@ class ExploreExecutor(Node):
                 if fb and hasattr(fb, 'navigation_time') and \
                         Duration.from_msg(fb.navigation_time) > Duration(seconds=self.nav_timeout):
                     self.get_logger().warn('Navigation timed out. Canceling goal...')
+                    timed_out = True
                     self.navigator.cancelNav()
                 time.sleep(0.1)
             result = self.navigator.getResult()
+            self.recorder.record('result', status={NavigationResult.SUCCEEDED: 'succeeded',
+                                                   NavigationResult.CANCELED: 'canceled',
+                                                   NavigationResult.FAILED: 'failed'}.get(result, 'unknown'),
+                                 timed_out=bool(timed_out), x=goal.pose.position.x, y=goal.pose.position.y,
+                                 wall_s=round(time.time() - t_goal, 2))
             if result == NavigationResult.SUCCEEDED:
                 self.get_logger().info('Goal succeeded!')
                 time.sleep(1.0)                           # the map grows with the view from the goal

@@ -119,9 +119,15 @@ class InstanceMapNode(Node):
         # record_dir: periodic state for offline datasets (recorder.py; '' = off)
         self.recorder = Recorder(self, 'instance_map', str(p('record_dir', '').value))
         if self.recorder:
-            self.create_timer(float(p('record_period', 5.0).value), self._record_state)
+            self.create_timer(float(p('record_period', 1.0).value), self._record_state_safe)
         self.get_logger().info(f'instance map: landmarks {self.landmark_queries}, objects {self.object_queries}, '
                                f'min confidence {self.map.min_conf}')
+
+    def _record_state_safe(self):
+        try:                                           # a record never takes the node down
+            self._record_state()
+        except Exception as e:                         # noqa: BLE001
+            self.get_logger().warn(f'[record] instances not written: {e!r}', throttle_duration_sec=30.0)
 
     def _record_state(self):
         """Every instance (reliable or tentative) for offline datasets."""

@@ -2,7 +2,8 @@
 
 Each node that records gets a `record_dir` parameter ('' = off) and writes
 <record_dir>/<name>.jsonl: a header line (node, git commit of the source tree, wall time), then
-one line per record() call with the ROS time (sim time with use_sim_time) and the given fields.
+one line per record() call with the ROS time (sim time with use_sim_time), the wall time and the
+given fields.
 numpy scalars / arrays are written as numbers / lists. Decisions are in the launch log; the
 records are periodic snapshots of the state those decisions were made on."""
 import json
@@ -47,7 +48,8 @@ class Recorder:
         if not record_dir:
             return
         os.makedirs(record_dir, exist_ok=True)
-        self.f = open(os.path.join(record_dir, f'{name}.jsonl'), 'w', buffering=1)
+        # append: a node restarted within the episode (the exploration loop) keeps its records
+        self.f = open(os.path.join(record_dir, f'{name}.jsonl'), 'a', buffering=1)
         commit, dirty = source_commit()
         self.f.write(json.dumps({'type': 'header', 'node': name, 'commit': commit, 'dirty': dirty,
                                  'wall': time.time()}) + '\n')
@@ -60,7 +62,7 @@ class Recorder:
             return
         t = self.node.get_clock().now().nanoseconds * 1e-9
         fields = _plain(fields)
-        fields.update(type=kind, t=round(t, 3))
+        fields.update(type=kind, t=round(t, 3), wall=round(time.time(), 3))
         try:
             self.f.write(json.dumps(fields, allow_nan=False) + '\n')
         except (ValueError, OSError) as e:

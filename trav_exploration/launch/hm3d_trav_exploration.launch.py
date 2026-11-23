@@ -244,7 +244,8 @@ def generate_launch_description():
     # dormant clusters are released by then or the map has changed.
     def explorer_node():
         return Node(package='trav_exploration', executable='explore_executor_node',
-                    output='screen', parameters=[{'use_sim_time': True}])
+                    output='screen', parameters=[{'use_sim_time': True,
+                                                  'record_dir': LaunchConfiguration('record_dir')}])
 
     def restart(left):
         def on_exit(event, context):
