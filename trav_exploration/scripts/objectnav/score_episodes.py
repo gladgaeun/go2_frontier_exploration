@@ -31,6 +31,11 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--episodes', required=True)
     p.add_argument('--out', default='', help='results directory (default: next to episodes.json)')
+    p.add_argument('--dataset-navmesh', action='store_true',
+                   help="score on the scene's shipped .basis.navmesh (runs made with run_episodes --dataset-navmesh)")
+    p.add_argument('--agent-radius', type=float, default=0.18)
+    p.add_argument('--agent-height', type=float, default=0.88)
+    p.add_argument('--max-climb', type=float, default=0.2)
     p.add_argument('--success-distance', type=float, default=0.2,
                    help='m to the nearest view point (the paper: 0.2; Habitat Challenge 2023 default 0.1)')
     args = p.parse_args()
@@ -46,10 +51,23 @@ def main():
         res = json.load(open(rp))
         nav = ep['glb'].replace('.glb', '.navmesh')
         if nav not in pfs:
-            pf = habitat_sim.PathFinder()
-            pf.load_nav_mesh(nav)
-            pfs[nav] = pf
-        pf = pfs[nav]
+            # the navmesh the agent moved on (run_episodes): recomputed for the agent by default,
+            # the scene's shipped file with --dataset-navmesh. Scoring on the shipped file while the
+            # agent moved on the recomputed one gave no distance to the goal for some stops.
+            for other in list(pfs):
+                if pfs[other][1] is not None:
+                    pfs[other][1].close()
+                pfs.pop(other)
+            if args.dataset_navmesh:
+                pf = habitat_sim.PathFinder()
+                pf.load_nav_mesh(nav)
+                pfs[nav] = (pf, None)
+            else:
+                from prepare_episodes import recomputed_pathfinder
+                sim = recomputed_pathfinder(habitat_sim, ep['glb'], args.agent_radius, args.agent_height,
+                                            args.max_climb)
+                pfs[nav] = (sim.pathfinder, sim)
+        pf = pfs[nav][0]
         dtg = float('inf')
         if res.get('final_pose'):
             pos = np.array(res['final_pose'][:3], dtype=np.float32)

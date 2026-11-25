@@ -45,6 +45,24 @@ def levels(pf, n=3000, seed=0):
     return [round(float(c), 2) for c, _ in out]
 
 
+def recomputed_pathfinder(habitat_sim, glb, radius, height, max_climb):
+    """The navmesh recomputed from the scene mesh for the agent, as habitat_server does (the one
+    ObjectNav v1 was made on with the HC2022 agent: radius 0.18, height 0.88, max climb 0.2)."""
+    cfg = habitat_sim.SimulatorConfiguration()
+    cfg.scene_id = glb
+    cfg.load_semantic_mesh = False
+    ag = habitat_sim.agent.AgentConfiguration()
+    ag.radius, ag.height, ag.sensor_specifications = radius, height, []
+    sim = habitat_sim.Simulator(habitat_sim.Configuration(cfg, [ag]))
+    ns = habitat_sim.NavMeshSettings()
+    ns.set_defaults()
+    ns.agent_radius, ns.agent_height, ns.agent_max_climb = radius, height, max_climb
+    if hasattr(ns, 'include_static_objects'):
+        ns.include_static_objects = True
+    sim.recompute_navmesh(sim.pathfinder, ns)
+    return sim                         # its pathfinder holds the navmesh; close it after the scene
+
+
 def cross_floor_episodes(pf, lv, goals, cats, n, rng, scene_dir, glb, habitat_sim):
     """Episodes that need the stairs: the start is on a floor with no object of the category
     (first view point of each goal object), the goals are on another floor and reachable on the
@@ -109,7 +127,8 @@ def main():
                    help='HM3D ObjectNav v1 val (2000 episodes, 20 scenes: the paper\'s benchmark) or v2 val '
                         '(1000 episodes, 36 scenes)')
     p.add_argument('--episodes-dir', default='', help='default: ~/data/datasets/objectnav/hm3d/unz/objectnav_hm3d_<dataset>/val/content')
-    p.add_argument('--scenes-dir', default=f'{home}/data/versioned_data/hm3d-0.2/hm3d/val')
+    p.add_argument('--scenes-dir', default='', help='default: ~/data/versioned_data/hm3d-0.1/hm3d/<split> '
+                   '(ObjectNav v1 was made on HM3D v0.1)')
     p.add_argument('--out', required=True)
     p.add_argument('--scenes', default='', help='comma-separated scene ids (e.g. 00800,TEEsavR23oF); all if empty')
     p.add_argument('--categories', default='', help='comma-separated categories; all six if empty')
@@ -121,12 +140,19 @@ def main():
                         'start floor: 2 of 1000 in val); cross: new episodes that start on a floor without '
                         'any object of the category, scored with the dataset goals and view points')
     p.add_argument('--limit', type=int, default=0, help='keep the first N episodes after interleaving the scenes')
+    p.add_argument('--dataset-navmesh', action='store_true',
+                   help="floors from the shipped .basis.navmesh instead of the one recomputed for the agent")
+    p.add_argument('--agent-radius', type=float, default=0.18)
+    p.add_argument('--agent-height', type=float, default=0.88)
+    p.add_argument('--max-climb', type=float, default=0.2)
     p.add_argument('--min-levels', type=int, default=1,
                    help='only scenes whose navmesh has at least this many floors (2: multi-floor scenes)')
     p.add_argument('--split', default='val', help='dataset split of the default --episodes-dir (val / train)')
     p.add_argument('--seed', type=int, default=0)
     args = p.parse_args()
 
+    if not args.scenes_dir:
+        args.scenes_dir = f'{home}/data/versioned_data/hm3d-0.1/hm3d/{args.split}'
     if not args.episodes_dir:
         args.episodes_dir = f'{home}/data/datasets/objectnav/hm3d/unz/objectnav_hm3d_{args.dataset}/{args.split}/content'
     import habitat_sim
@@ -134,6 +160,7 @@ def main():
     cats = [c.strip() for c in args.categories.split(',') if c.strip()]
     rng = random.Random(args.seed)
     out = []
+    sim = None
     for f in sorted(glob.glob(os.path.join(args.episodes_dir, '*.json.gz'))):
         d = json.load(gzip.open(f))
         if not d['episodes']:
@@ -147,8 +174,15 @@ def main():
         if not (os.path.exists(glb) and os.path.exists(nav)):
             print(f'skip {scene_dir}: scene not found under {args.scenes_dir}')
             continue
-        pf = habitat_sim.PathFinder()
-        pf.load_nav_mesh(nav)
+        if sim is not None:
+            sim.close()
+            sim = None
+        if args.dataset_navmesh:
+            pf = habitat_sim.PathFinder()
+            pf.load_nav_mesh(nav)
+        else:
+            sim = recomputed_pathfinder(habitat_sim, glb, args.agent_radius, args.agent_height, args.max_climb)
+            pf = sim.pathfinder
         lv = levels(pf)
         if len(lv) < args.min_levels:
             print(f'skip {scene_dir}: {len(lv)} floor(s)')
