@@ -119,11 +119,14 @@ def run_episode(ep, args, d):
     os.makedirs(d, exist_ok=True)
     traj = os.path.join(d, 'trajectory.txt')
     start = ','.join(f'{v:.4f}' for v in ep['start']) + f",{ep['yaw']:.4f}"
-    # the agent moves on the scene's own navmesh, the one the episodes (start, geodesic distance)
-    # and the scoring use: a navmesh recomputed for radius 0.18 cut the narrow top of the stairs of
-    # 00803 off its upper floor (goal 1.2 m away on the dataset navmesh, 66 m on the recomputed one)
+    # the navmesh the episodes were made on: ObjectNav v1 (HM3D v0.1) matches the navmesh recomputed
+    # from the scene mesh for the HC2022 agent (radius 0.18, height 0.88, max climb 0.2) exactly
+    # (geodesic difference 0.000 m, no episode without a path); the shipped .basis.navmesh is a
+    # generic one (radius 0.1, height 1.5) that left 2-3 % of the episodes without a path to any
+    # goal. --dataset-navmesh: the shipped file (runs before 2026-11-24)
+    nav = '--no-recompute-navmesh' if args.dataset_navmesh else f'--max-climb {args.max_climb}'
     server = subprocess.Popen(
-        conda_cmd(args.habitat_env, f'python -u {SERVER} --scene {ep["glb"]} --no-recompute-navmesh '
+        conda_cmd(args.habitat_env, f'python -u {SERVER} --scene {ep["glb"]} {nav} '
                                     f'--start={start} --bind {args.habitat_address} --trajectory {traj}'),
         stdout=open(os.path.join(d, 'server.log'), 'w'), stderr=subprocess.STDOUT, start_new_session=True)
     t0 = time.time()
@@ -245,6 +248,10 @@ def main():
     p.add_argument('--domain-id', type=int, default=57, help='ROS_DOMAIN_ID (keeps other ROS sessions apart)')
     p.add_argument('--rviz', action='store_true')
     p.add_argument('--launch-args', default='', help='extra launch arguments')
+    p.add_argument('--dataset-navmesh', action='store_true',
+                   help="the scene's shipped .basis.navmesh instead of the navmesh recomputed for the agent")
+    p.add_argument('--max-climb', type=float, default=0.2,
+                   help='max step of the recomputed navmesh [m] (Habitat default 0.2, as ObjectNav v1)')
     p.add_argument('--record', action='store_true',
                    help='state records of voxel_mapper / frontier_goal / instance_map in <episode>/record '
                         '(offline datasets, recorder.py)')

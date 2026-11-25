@@ -213,7 +213,13 @@ class FrontierGoalNode(Node):
         # often holds only the lower steps (the flight seen from below splits into clusters); with
         # 1 m the stairs of 00800 were never climbed.
         self.stair_lead_rise = float(p('stair_lead_rise', 0.4).value)
-        self.climb_timeout = float(p('climb_timeout', 600.0).value)  # s (wall clock)
+        self.climb_timeout = float(p('climb_timeout', 600.0).value)
+        # voxel_mapper's step check (stair_steps) is logged only: before a climb the stairs are seen
+        # in part from below, and its "no flight" left out real stairs (HM3D v0.1 00267: a reliable
+        # flight, gamma 0.94, on the navmesh, seen at -0.14 / 0.14 / 0.89 m, so the floor ended).
+        # As in the paper, a stair candidate is verified by climbing it (two failed climbs leave it
+        # out). True: the old rule (a "no flight" verdict leaves the landmark out)
+        self.stair_check_reject = bool(p('stair_check_reject', False).value)  # s (wall clock)
         self.z_r = None
         self.landmarks = []           # (entrance x, y, z, top x, y, z, size)
         # entrance xy of the stairs given up (failed twice: the repeated-failure rule, Sec. VI-C).
@@ -598,7 +604,7 @@ class FrontierGoalNode(Node):
         for lm in self.landmarks:
             if (lm[7] >= 0.5) != reliable:
                 continue
-            if len(lm) > 10 and lm[10] < 0:
+            if self.stair_check_reject and len(lm) > 10 and lm[10] < 0:
                 continue                   # no step structure there (voxel_mapper stair check)
             if abs(lm[2] - self.z_r) <= 0.4 and lm[5] > self.z_r + self.stair_lead_rise:
                 d, e = 1, (lm[0], lm[1], lm[2])
