@@ -48,37 +48,35 @@ def _list(v):
     return v or []
 
 
-class FloorFeatures:
-    """Keeps the per-floor history of one episode; step() returns the 15 features."""
+class FloorTracker:
+    """Floor IDs of one episode from the robot's floor estimate z_r (map z), one call per
+    decision time. The start floor counts at once; a new floor needs NEW_FLOOR_HOLD steps of the
+    same z_r off the stairs (not climbing). Shared by FloorFeatures and rooms.RoomMap."""
 
-    def __init__(self, target):
-        self.target = target
-        self.label = PROMPTS.get(target, target)
+    def __init__(self):
         self.floors = []                   # visited floor heights (map z)
-        self.dwell = {}                    # floor index -> actions spent on it
         self.pending = None                # (z, steps) of a new z_r not yet a floor
-        self.last_actions = None
         self.cur = None                    # index of the current floor in self.floors
 
-    # -- floors -------------------------------------------------------------------------------
-    def _find(self, z):
+    def find(self, z):
         for i, f in enumerate(self.floors):
             if abs(z - f) < FLOOR_MATCH:
                 return i
         return None
 
-    def _update_floor(self, z_r, climbing):
-        i = self._find(z_r)
+    def update(self, z_r, climbing):
+        """Current floor index, or None while z_r is not a floor (yet)."""
+        i = self.find(z_r)
         if i is not None:
             self.cur, self.pending = i, None
-            return
-        if not self.floors:                # the start floor counts at once
+            return i
+        if not self.floors:
             self.floors.append(z_r)
             self.cur = 0
-            return
+            return 0
         if climbing:
             self.pending = None
-            return
+            return None
         if self.pending is not None and abs(self.pending[0] - z_r) < FLOOR_MATCH:
             self.pending = (self.pending[0], self.pending[1] + 1)
         else:
@@ -86,6 +84,34 @@ class FloorFeatures:
         if self.pending[1] >= NEW_FLOOR_HOLD:
             self.floors.append(self.pending[0])
             self.cur, self.pending = len(self.floors) - 1, None
+            return self.cur
+        return None
+
+
+class FloorFeatures:
+    """Keeps the per-floor history of one episode; step() returns the 15 features."""
+
+    def __init__(self, target):
+        self.target = target
+        self.label = PROMPTS.get(target, target)
+        self.ft = FloorTracker()
+        self.dwell = {}                    # floor index -> actions spent on it
+        self.last_actions = None
+
+    # -- floors -------------------------------------------------------------------------------
+    @property
+    def floors(self):
+        return self.ft.floors
+
+    @property
+    def cur(self):
+        return self.ft.cur
+
+    def _find(self, z):
+        return self.ft.find(z)
+
+    def _update_floor(self, z_r, climbing):
+        self.ft.update(z_r, climbing)
 
     # -- per-floor sums of the voxel layers ----------------------------------------------------
     @staticmethod

@@ -8,8 +8,8 @@ class gets pos_weight = (weighted negatives) / (weighted positives) of the train
 
 Models
   logreg  : linear on x (+ one-hot)
-  mlp     : floor encoder Linear(15, H) + ReLU, concat one-hot, head Linear(H + 6, H) + ReLU +
-            Linear(H, 1)   (the plan's layers; x has 15 numbers until the room histogram is added)
+  mlp     : floor encoder Linear(d, H) + ReLU, concat one-hot, head Linear(H + 6, H) + ReLU +
+            Linear(H, 1)   (the plan's layers; d = 15, or 24 with --rooms)
   single  : one feature as the score (sanity: does it rank at all)
 Reports the episode-weighted AUROC per fold (mean, std) and writes out-of-fold predictions.
 Run with torch available (e.g. `conda activate blip2`).
@@ -26,11 +26,14 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from floor_switch.features import CATEGORIES, NAMES, one_hot  # noqa: E402
+from floor_switch.rooms import ROOMS  # noqa: E402
+
+ROOM_COLS = [r.replace(' ', '_') for r in ROOMS]
 
 COUNTS = ('n_frontier', 'cand_pos', 'cand_neg', 'o_floors', 'o_exhausted', 'o_stair_floors')
 
 
-def load(runs, feats, labels, split):
+def load(runs, feats, labels, split, rooms=''):
     sp = json.load(open(split))
     train_scenes = {s[:5] for s in sp['train']}
     eps = json.load(open(os.path.join(runs, 'episodes.json')))
@@ -42,12 +45,24 @@ def load(runs, feats, labels, split):
         if not (os.path.exists(fp) and os.path.exists(lp)):
             continue
         lab = {round(float(r['t']), 2): r for r in csv.DictReader(open(lp))}
+        room = {}
+        if rooms:
+            rp = os.path.join(rooms, e['id'] + '.csv')
+            if not os.path.exists(rp):
+                continue
+            room = {round(float(r['t']), 2): [float(r[c]) for c in ROOM_COLS] for r in csv.DictReader(open(rp))}
         rows = []
         for r in csv.DictReader(open(fp)):
             l = lab.get(round(float(r['t']), 2))
             if l is None or l['in_band'] != '1' or l['label'] == '':
                 continue
-            rows.append(([float(r[n]) for n in NAMES], int(l['label']), float(r['t'])))
+            x = [float(r[n]) for n in NAMES]
+            if rooms:
+                rr = room.get(round(float(r['t']), 2))
+                if rr is None:
+                    continue
+                x += rr
+            rows.append((x, int(l['label']), float(r['t'])))
         if not rows:
             continue
         w = 1.0 / len(rows)
@@ -119,6 +134,8 @@ def main():
     ap.add_argument('--runs', default=H('~/objectnav_runs/collect_v01'))
     ap.add_argument('--feats', default=H('~/objectnav_runs/floor_switch/features'))
     ap.add_argument('--labels', default=H('~/objectnav_runs/floor_switch/labels'))
+    ap.add_argument('--rooms', default='', help='room histogram dir (make_room_features.py T<T>/); '
+                                                  'empty: the 15 features only')
     ap.add_argument('--split', default=H('~/objectnav_runs/floor_switch_split.json'))
     ap.add_argument('--out', default=H('~/objectnav_runs/floor_switch/baseline'))
     ap.add_argument('--folds', type=int, default=5)
@@ -129,7 +146,8 @@ def main():
     ap.add_argument('--mlp-wd', type=float, default=1e-4)
     args = ap.parse_args()
 
-    X, Y, W, G, C, E, T = load(args.runs, args.feats, args.labels, args.split)
+    X, Y, W, G, C, E, T = load(args.runs, args.feats, args.labels, args.split, args.rooms)
+    names = list(NAMES) + (ROOM_COLS if args.rooms else [])
     OH = np.stack([one_hot(c) for c in C])
     print(f'{len(set(E))} episodes, {len(set(G))} scenes, {len(Y)} decision times, '
           f'y=1 {Y.mean():.3f} (episode-weighted {W[Y == 1].sum() / W.sum():.3f})')
@@ -166,7 +184,7 @@ def main():
               f'folds {" ".join(f"{a:.3f}" for a in per)}', flush=True)
 
     print('single features (pooled AUROC; < 0.5 means the feature points to "not on this floor"):')
-    for j, n in enumerate(NAMES):
+    for j, n in enumerate(names):
         print(f'  {n:15s} {auroc(X[:, j], Y, W):.3f}')
 
     best = 'mlp64 x+onehot'
