@@ -28,16 +28,16 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from floor_switch.features import CATEGORIES, NAMES, one_hot  # noqa: E402
+from floor_switch.model import COUNTS  # noqa: E402
 from floor_switch.rooms import ROOMS  # noqa: E402
 
 ROOM_COLS = [r.replace(' ', '_') for r in ROOMS]
 
-COUNTS = ('n_frontier', 'cand_pos', 'cand_neg', 'o_floors', 'o_exhausted', 'o_stair_floors')
 
-
-def load(runs, feats, labels, split, rooms=''):
+def load(runs, feats, labels, split, rooms='', which='train'):
+    """Samples of the scenes of split[which] ('train' or 'sim_dev')."""
     sp = json.load(open(split))
-    train_scenes = {s[:5] for s in sp['train']}
+    train_scenes = {s[:5] for s in sp[which]}
     eps = json.load(open(os.path.join(runs, 'episodes.json')))
     X, Y, W, G, C, E, T, AB = [], [], [], [], [], [], [], []
     for e in eps:

@@ -17,5 +17,5 @@ setup(
     description='Floor-switch model on top of trav_exploration',
     license='BSD-3-Clause',
     tests_require=['pytest'],
-    entry_points={'console_scripts': []},
+    entry_points={'console_scripts': ['floor_switch_node = floor_switch.floor_switch_node:main']},
 )

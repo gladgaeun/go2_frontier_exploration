@@ -747,6 +747,29 @@ Visualization Manager:
       Reliability Policy: Reliable
       Value: /frontier_goal/target_goal
     Value: true
+  - Class: rviz_default_plugins/MarkerArray
+    Enabled: true
+    Name: FloorSwitch
+    Namespaces: {}
+    Topic:
+      Depth: 2
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /floor_switch/markers
+    Value: true
+  - Class: rviz_default_plugins/Marker
+    Enabled: true
+    Name: FloorSwitchDecision
+    Namespaces: {}
+    Topic:
+      Depth: 10
+      Durability Policy: Volatile
+      Filter size: 10
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /floor_switch/decision
+    Value: true
   - Class: rviz_default_plugins/Marker
     Enabled: true
     Name: UnreachableFrontiers

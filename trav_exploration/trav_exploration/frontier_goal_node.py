@@ -93,7 +93,19 @@
 # This node then asks the voxel map to climb it (voxel_map/climb_at: a 3-D path to its foot, then
 # the climb) and answers only when that is done, with no goal; the explorer asks rank 0 again
 # (its empty-goal retries) on the new floor.
+#
+# Floor switch (floor_switch package, v0; floor_switch_enable, default false = the behaviour above):
+# floor_switch_node publishes floor_switch/state every second: p (target on this floor) and
+# `ready` (the last X p below tau and the cost guard passes). At the decision times, a frontier_pose
+# request of rank 0 without a reliable target on this floor, and every floor_switch_period s while
+# driving to a frontier (the Nav2 goal is canceled so the explorer asks again), a fresh ready state
+# of this floor switches: the floor gets a defer flag (deferred_floors; not exhausted: a stair
+# destination again once the other floors are), the candidates are the reliable stair landmarks
+# to a floor neither explored nor deferred (none: no switch), and the climb is not called off for
+# new frontiers on this floor (climb_abort_on_frontiers). On the way back to a deferred floor the
+# flag is cleared; F-exhausted stair choices prefer floors that are not deferred.
 
+import json
 import math
 import threading
 import time
@@ -229,6 +241,7 @@ class FrontierGoalNode(Node):
         self.climbed = []
         self.climb_fails = {}         # entrance xy -> failed climbs
         self.explored_floors = []     # z_r of the floors whose frontiers were exhausted
+        self.deferred_floors = []     # z_r of the floors left by a floor switch (not exhausted)
         self.climb_done = threading.Event()
         self.climb_z = None
         self.climb_on_stairs = False
@@ -335,6 +348,18 @@ class FrontierGoalNode(Node):
         if self.recorder:
             self.create_timer(float(p('record_period', 1.0).value), self._record_state,
                               callback_group=MutuallyExclusiveCallbackGroup())
+        # floor switch (floor_switch_node, v0): see the header
+        self.fs_enable = bool(p('floor_switch_enable', False).value)
+        self.fs_fresh = float(p('floor_switch_fresh', 3.0).value)       # s (wall clock)
+        self.fs_state, self.fs_wall, self.fs_pending = None, 0.0, None
+        # RViz: a red text where the robot switched (kept), in the map frame
+        self.fs_marker_pub = self.create_publisher(Marker, 'floor_switch/decision', 10)
+        self.fs_n = 0
+        if self.fs_enable:
+            self.create_subscription(String, 'floor_switch/state', self._on_fs_state, 10, callback_group=inputs)
+            self.create_timer(float(p('floor_switch_period', 10.0).value), self._fs_tick,
+                              callback_group=MutuallyExclusiveCallbackGroup())
+            self.get_logger().info('[floor-switch] on: switching floors on floor_switch/state')
         self.get_logger().info(f'frontier goals from voxel_map/frontier_clusters, order {self.goal_order}, '
                                f'goal_clearance {self.goal_clearance} m')
 
@@ -569,6 +594,7 @@ class FrontierGoalNode(Node):
         last = getattr(self, 'last_goal', None)
         return dict(
             robot=[rx, ry], z_r=z, explored_floors=list(self.explored_floors),
+            deferred_floors=list(self.deferred_floors),
             tracking_target=bool(getattr(self, 'tracking_target', False)) and not self.target_found,
             goal_kind=None if last is None else last[0], goal=None if last is None else last[1],
             climbed=[list(c) for c in self.climbed], target=self.target, target_found=bool(self.target_found),
@@ -626,6 +652,78 @@ class FrontierGoalNode(Node):
     def _floor_explored(self, direction):
         """The next floor that way was explored (its frontiers exhausted) already."""
         return any(1.0 < direction * (z - self.z_r) < 4.5 for z in self.explored_floors)
+
+    def _floor_deferred(self, direction):
+        """The next floor that way was left by a floor switch."""
+        return any(1.0 < direction * (z - self.z_r) < 4.5 for z in self.deferred_floors)
+
+    def _on_fs_state(self, msg):
+        try:
+            self.fs_state = json.loads(msg.data)
+            self.fs_wall = time.time()
+        except ValueError:
+            pass
+
+    def _fs_ready(self):
+        """The latest floor_switch state if it is fresh, of this floor and ready; else None."""
+        s = self.fs_state
+        if s is None or not s.get('ready') or time.time() - self.fs_wall > self.fs_fresh:
+            return None
+        if self.z_r is None or s.get('floor_z') is None or abs(s['floor_z'] - self.z_r) >= 0.5:
+            return None
+        return s
+
+    def _switch_cands(self):
+        """Reliable stair landmarks of this floor to a floor neither explored nor deferred."""
+        if self.z_r is None:
+            return []
+        return [c for c in self._stair_candidates()
+                if not self._floor_explored(c[1]) and not self._floor_deferred(c[1])]
+
+    def _fs_tick(self):
+        """Decision time every floor_switch_period s: driving to a frontier with a ready switch,
+        cancel the Nav2 goal; the explorer asks again and the request switches."""
+        if self.serving or self.target_found or self.pursued is None or self.fs_pending is not None:
+            return
+        s = self._fs_ready()
+        if s is None or not self._switch_cands() or not self.cancel_cli.service_is_ready():
+            return
+        self.fs_pending = self.z_r
+        self.pursued = None                           # cleared, not failed
+        self.get_logger().info(f'[floor-switch] p {s["p"]:.2f}: switch ready while driving to a frontier: '
+                               f'navigation canceled')
+        self.cancel_cli.call_async(CancelGoal.Request())
+
+    def _floor_switch(self, rx, ry, s):
+        z0 = self.z_r
+        if s is not None:
+            self.get_logger().info(
+                f'[floor-switch] p {s["p"]:.2f}, the last {s["n_hist"]} below tau on this floor (z_r {z0:.2f}); '
+                f'stairs {s["stairs"]:.1f} m, actions {s["actions"]:.0f} (guard {s["need"]:.0f} left): '
+                f'deferring this floor and taking the stairs')
+        else:
+            self.get_logger().info(f'[floor-switch] switch decided at the last check (z_r {z0:.2f}): deferring '
+                                   f'this floor and taking the stairs')
+        if not any(abs(z - z0) < 0.5 for z in self.deferred_floors):
+            self.deferred_floors.append(z0)
+        self.fs_n += 1
+        m = Marker()
+        m.header.frame_id = self.map_frame
+        m.ns, m.id, m.type, m.action = 'floor_switch_decision', self.fs_n, Marker.TEXT_VIEW_FACING, Marker.ADD
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = float(rx), float(ry), float(z0) + 2.1
+        m.pose.orientation.w = 1.0
+        m.scale.z = 0.35
+        m.color = ColorRGBA(r=1.0, g=0.1, b=0.1, a=1.0)
+        m.text = (f'SWITCH #{self.fs_n}' + (f' p {s["p"]:.2f}' if s is not None else '')
+                  + f' t {self.get_clock().now().nanoseconds * 1e-9:.0f}s')
+        self.fs_marker_pub.publish(m)
+        if self.recorder:
+            try:
+                self.recorder.record('switch', z_r=z0, state=s)
+            except Exception as e:             # noqa: BLE001
+                self.get_logger().warn(f'[record] switch not written: {e!r}', throttle_duration_sec=30.0)
+        self.fs_pending = None
+        self._stair_goal(rx, ry, switch=True)
 
     def _robot_xy(self):
         try:
@@ -1144,7 +1242,7 @@ class FrontierGoalNode(Node):
         m.color = ColorRGBA(r=1.0, g=0.2, b=0.6, a=0.9)
         self.target_goal_pub.publish(m)
 
-    def _stair_goal(self, rx, ry, want_dir=None):
+    def _stair_goal(self, rx, ry, want_dir=None, switch=False):
         """A = O_stair (eq. 9): F is exhausted (or a target was seen on another floor, want_dir):
         go up or down the stairs to a floor not explored yet (or toward the target). Among the
         reliable stair landmarks the first node of the open ATSP over their entrances on this
@@ -1154,13 +1252,21 @@ class FrontierGoalNode(Node):
         entrance and up (voxel_map/climb_at) or down (voxel_map/descend_at); this waits for it and
         returns None (no goal: the explorer asks again on the new floor). Sending the entrance as
         a Nav2 goal instead failed: the 2-D explorer then blacklisted reached goals, and
-        meanwhile new frontiers took the robot away again."""
+        meanwhile new frontiers took the robot away again.
+        switch: a floor switch (floor_switch_node): reliable stairs to a floor neither explored nor
+        deferred only, not called off for new frontiers on this floor; this floor stays deferred
+        only if the robot reached another floor."""
         self.goal_kind = 'stairs'
         def allowed(c):
-            return c[1] == want_dir if want_dir is not None else not self._floor_explored(c[1])
+            if want_dir is not None:
+                return c[1] == want_dir
+            return not self._floor_explored(c[1]) and not (switch and self._floor_deferred(c[1]))
         cands = [c for c in self._stair_candidates() if allowed(c)]
+        if not switch and want_dir is None:
+            # F exhausted: a floor not left by a floor switch first (the deferred ones after)
+            cands = [c for c in cands if not self._floor_deferred(c[1])] or cands
         resume = getattr(self, 'stair_resume', None)
-        if resume is not None and want_dir is None:
+        if resume is not None and want_dir is None and not switch:
             # the last climb stopped on these stairs: go on the same way (from the bottom step
             # the stairs no longer lead "down" by the candidate rule, and exploration ended)
             # from where the robot stands: sent to the stair head again, it drove back up first
@@ -1180,8 +1286,10 @@ class FrontierGoalNode(Node):
             lm, d, e = cands[k]
         else:
             # no reliable stair cluster: verify the tentative one with the largest belief gamma n
-            tent = [c for c in self._stair_candidates(reliable=False) if allowed(c)]
+            tent = [] if switch else [c for c in self._stair_candidates(reliable=False) if allowed(c)]
             if not tent:
+                if switch:
+                    self.deferred_floors = [z for z in self.deferred_floors if abs(z - self.z_r) >= 0.5]
                 return None
             lm, d, e = max(tent, key=lambda c: c[0][8])
             self.get_logger().info(f'[stairs] no reliable stair landmark: verifying the tentative one at '
@@ -1190,6 +1298,7 @@ class FrontierGoalNode(Node):
         self.climb_done.clear()
         way = 'up' if d > 0 else 'down'
         reason = ('a target on the floor ' + ('above' if d > 0 else 'below') if want_dir is not None
+                  else f'floor switch (z_r {z0:.2f})' if switch
                   else f'no frontier left on this floor (z_r {z0:.2f})')
         self.get_logger().info(f'[stairs] {reason}: going {way} the stairs at ({e[0]:.2f}, {e[1]:.2f}), '
                                f'{"top" if d > 0 else "foot"} {lm[5] if d > 0 else lm[2]:.2f} m'
@@ -1225,7 +1334,7 @@ class FrontierGoalNode(Node):
                 self.climb_cancel_pub.publish(Empty())
                 asked = True
                 continue
-            if not self.climb_abort or want_dir is not None:
+            if not self.climb_abort or want_dir is not None or switch:
                 continue
             n = self._frontiers_back(z0)
             if n:
@@ -1236,6 +1345,7 @@ class FrontierGoalNode(Node):
         if done and getattr(self, 'climb_cancelled', False):
             # called off: not a failure of the stairs, and this floor is not exhausted after all
             self.explored_floors = [z for z in self.explored_floors if abs(z - z0) >= 0.5]
+            self.deferred_floors = [z for z in self.deferred_floors if abs(z - z0) >= 0.5]
             self.stair_resume = None
             self.reach = None
             self.plan = None
@@ -1246,6 +1356,9 @@ class FrontierGoalNode(Node):
         self.stair_resume = None
         if done and z1 is not None and not self.climb_on_stairs and d * (z1 - z0) > 0.5 * self.stair_rise:
             self.get_logger().info(f'[stairs] went {way}: z_r {z0:.2f} -> {z1:.2f}; exploring the new floor')
+            if any(abs(z - z1) < 0.5 for z in self.deferred_floors):
+                self.get_logger().info(f'[floor-switch] back on the deferred floor z_r {z1:.2f}: flag cleared')
+                self.deferred_floors = [z for z in self.deferred_floors if abs(z - z1) >= 0.5]
             # the climb ended with its own turn in place where the robot now stands: the space
             # around was seen once, a second turn (the look-around) only repeats it
             self.need_look_around = self.look_around and not getattr(self, 'climb_turned', False)
@@ -1261,6 +1374,8 @@ class FrontierGoalNode(Node):
                 self.climbed.append((e[0], e[1]))
             elif done and self.climb_on_stairs:
                 self.stair_resume = (lm, d, e)
+            if switch:
+                self.deferred_floors = [z for z in self.deferred_floors if abs(z - z0) >= 0.5]
             self.get_logger().warn(f'[stairs] going {way} did not reach a new floor '
                                    f'({"timed out" if not done else z1}); '
                                    + ('these stairs are left out' if out else 'trying them once more later'))
@@ -1407,6 +1522,15 @@ class FrontierGoalNode(Node):
                 self.get_logger().info(f'Sending goal x: {gx:f} y: {gy:f} (target).')
                 return response
         if self.goal_order == 'atsp':
+            if request.goal_rank == 0 and tgt is None and self.fs_enable:
+                s = self._fs_ready()
+                pend = self.fs_pending is not None and self.z_r is not None and abs(self.fs_pending - self.z_r) < 0.5
+                self.fs_pending = None
+                if (s is not None or pend) and self._switch_cands():
+                    self._floor_switch(rx, ry, s)      # A = O_stair now (no goal: asked again on the new floor)
+                    pose.header.frame_id = ''
+                    response.goal_pose = pose
+                    return response
             if request.goal_rank == 0 and self.need_look_around:
                 live = [c for c in reachable if not self._is_dormant(c, (c[0], c[1]))]
                 if self.look_around_min <= 0 or len(live) < self.look_around_min:

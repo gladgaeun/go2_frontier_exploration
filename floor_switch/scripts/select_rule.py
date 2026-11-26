@@ -30,6 +30,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from floor_switch.features import FloorTracker  # noqa: E402
+from floor_switch.rule import stair_distance  # noqa: E402
 
 
 def read_jsonl(path, kind):
@@ -50,22 +51,6 @@ def cum_actions(path, step=0.25, turn=math.radians(30.0)):
     d = np.hypot(np.diff(a[:, 1]), np.diff(a[:, 3]))
     r = np.abs((np.diff(a[:, 4]) + math.pi) % (2.0 * math.pi) - math.pi)
     return list(a[:, 0]), np.concatenate([[0.0], np.cumsum(d / step + r / turn)])
-
-
-def stair_distance(state):
-    """Distance (m, straight line) from the robot to the nearest known (reliable) stair entrance
-    of its floor (foot on this floor going up, or reaching down from it); None if none."""
-    z, rob = state.get('z_r'), state.get('robot')
-    if z is None or not rob or rob[0] is None:
-        return None
-    best = None
-    for lm in state.get('landmarks') or []:
-        if len(lm) > 7 and lm[7] < 0.5:
-            continue
-        if abs(lm[2] - z) <= 0.4 or (lm[2] < z - 0.5 and lm[5] >= z - 1.0):
-            d = math.hypot(lm[0] - rob[0], lm[1] - rob[1])
-            best = d if best is None or d < best else best
-    return best
 
 
 def episode_visits(run_dir, rows):
