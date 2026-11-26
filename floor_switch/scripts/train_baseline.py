@@ -3,7 +3,9 @@
 
 Data: features (make_features.py) joined with labels (make_labels.py) at each decision time,
 only times on a floor (in_band) of episodes in the train scenes of floor_switch_split.json.
-Sample weight: 1 / (decision times of the episode), so every episode counts once; the positive
+Sample weight: 1 / (decision times of the episode), so every episode counts once; with
+--cat-weights also times pi_c / q_c per category and A/B (the real mix of ObjectNav v1 train,
+computed on each fold's training scenes); the positive
 class gets pos_weight = (weighted negatives) / (weighted positives) of the training fold.
 
 Models
@@ -37,7 +39,7 @@ def load(runs, feats, labels, split, rooms=''):
     sp = json.load(open(split))
     train_scenes = {s[:5] for s in sp['train']}
     eps = json.load(open(os.path.join(runs, 'episodes.json')))
-    X, Y, W, G, C, E, T = [], [], [], [], [], [], []
+    X, Y, W, G, C, E, T, AB = [], [], [], [], [], [], [], []
     for e in eps:
         if e['id'][:5] not in train_scenes:
             continue
@@ -68,12 +70,31 @@ def load(runs, feats, labels, split, rooms=''):
         w = 1.0 / len(rows)
         for x, y, t in rows:
             X.append(x); Y.append(y); W.append(w); G.append(e['id'][:5]); C.append(e['category'])
-            E.append(e['id']); T.append(t)
+            E.append(e['id']); T.append(t); AB.append('A' if e['goal_on_start_floor'] else 'B')
     X = np.array(X)
     for n in COUNTS:
         j = NAMES.index(n)
         X[:, j] = np.log1p(X[:, j])
-    return X, np.array(Y), np.array(W), np.array(G), np.array(C), np.array(E), np.array(T)
+    return X, np.array(Y), np.array(W), np.array(G), np.array(C), np.array(E), np.array(T), np.array(AB)
+
+
+def category_weights(candidates, scenes, C, AB, E, G, alpha=1.0, cap=5.0):
+    """Per-episode weights w(c, A) = pi_c(A) / q_c(A), w(c, B) = pi_c(B) / q_c(B) (plan sec. 8.4).
+
+    pi_c: the A/B mix of category c among the candidate episodes (ObjectNav v1 train) of `scenes`;
+    q_c: the mix among the collected episodes of those scenes. Pseudo-count `alpha` per cell,
+    weights capped at `cap`. Returns one weight per sample (C, AB, E, G arrays)."""
+    pi, q = {}, {}
+    for c in CATEGORIES:
+        a = sum(1 for e in candidates if e['category'] == c and e['id'][:5] in scenes and e['goal_on_start_floor'])
+        b = sum(1 for e in candidates if e['category'] == c and e['id'][:5] in scenes and not e['goal_on_start_floor'])
+        pi[c] = (a + alpha) / (a + b + 2 * alpha)
+        eps = {(e, ab) for e, cc, ab, g in zip(E, C, AB, G) if cc == c and g in scenes}
+        qa = sum(1 for _, ab in eps if ab == 'A')
+        q[c] = (qa + alpha) / (len(eps) + 2 * alpha)
+    w = np.array([min(cap, pi[c] / q[c]) if ab == 'A' else min(cap, (1 - pi[c]) / (1 - q[c]))
+                  for c, ab in zip(C, AB)])
+    return w, pi, q
 
 
 def auroc(score, y, w):
@@ -138,6 +159,10 @@ def main():
                                                   'empty: the 15 features only')
     ap.add_argument('--split', default=H('~/objectnav_runs/floor_switch_split.json'))
     ap.add_argument('--out', default=H('~/objectnav_runs/floor_switch/baseline'))
+    ap.add_argument('--candidates', default=H('~/objectnav_runs/collect_v01/candidates.json'),
+                    help='ObjectNav v1 train candidates: the real A/B mix per category (pi_c)')
+    ap.add_argument('--cat-weights', action='store_true',
+                    help='train with the per-category episode weights pi_c / q_c (plan sec. 8.4)')
     ap.add_argument('--folds', type=int, default=5)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--epochs', type=int, default=400, help='full-batch Adam steps, logistic regression')
@@ -146,7 +171,16 @@ def main():
     ap.add_argument('--mlp-wd', type=float, default=1e-4)
     args = ap.parse_args()
 
-    X, Y, W, G, C, E, T = load(args.runs, args.feats, args.labels, args.split, args.rooms)
+    X, Y, W, G, C, E, T, AB = load(args.runs, args.feats, args.labels, args.split, args.rooms)
+    cands = json.load(open(args.candidates))
+    # evaluation weights of the real A/B mix (all train scenes); training weights per fold below
+    CW, pi, q = category_weights(cands, set(G), C, AB, E, G)
+    WR = W * CW
+    print('category  pi_c(A) real  q_c(A) collected  w(A)  w(B)')
+    for c in CATEGORIES:
+        print(f'  {c:11s} {pi[c]:.3f}  {q[c]:.3f}  {min(5, pi[c] / q[c]):.2f}  {min(5, (1 - pi[c]) / (1 - q[c])):.2f}')
+    print(f'B share: collected {np.mean([ab == "B" for ab in dict(zip(E, AB)).values()]):.3f}, '
+          f'real (weighted) {sum(CW[E == e][0] for e in set(E[AB == "B"])) / sum(CW[E == e][0] for e in set(E)):.3f}')
     names = list(NAMES) + (ROOM_COLS if args.rooms else [])
     OH = np.stack([one_hot(c) for c in C])
     print(f'{len(set(E))} episodes, {len(set(G))} scenes, {len(Y)} decision times, '
@@ -160,10 +194,14 @@ def main():
     results = {}
     for name, kind, oh, h in configs:
         oof = np.full(len(Y), np.nan)
-        per = []
+        per, per_r = [], []
         for fi, test in enumerate(fs):
             te = np.array([g in test for g in G])
             tr = ~te
+            Wt = W
+            if args.cat_weights:
+                cw, _, _ = category_weights(cands, set(G[tr]), C, AB, E, G)
+                Wt = W * cw
             mu, sd = X[tr].mean(0), X[tr].std(0) + 1e-6
             Xn = (X - mu) / sd
             Z = np.concatenate([Xn, OH], 1) if oh else Xn
@@ -173,14 +211,18 @@ def main():
                 lin = model
                 model = torch.nn.Sequential(lin, torch.nn.Flatten(0))
             if kind == 'lin':
-                fit(model, Z[tr], Y[tr], W[tr], args.epochs, 1e-2, 1e-4, args.seed + fi)
+                fit(model, Z[tr], Y[tr], Wt[tr], args.epochs, 1e-2, 1e-4, args.seed + fi)
             else:
-                fit(model, Z[tr], Y[tr], W[tr], args.mlp_epochs, args.mlp_lr, args.mlp_wd, args.seed + fi)
+                fit(model, Z[tr], Y[tr], Wt[tr], args.mlp_epochs, args.mlp_lr, args.mlp_wd, args.seed + fi)
             with torch.no_grad():
                 oof[te] = model(torch.tensor(Z[te], dtype=torch.float32)).numpy()
             per.append(auroc(oof[te], Y[te], W[te]))
-        results[name] = (np.mean(per), np.std(per), auroc(oof, Y, W), oof)
-        print(f'{name:18s} AUROC fold mean {np.mean(per):.3f} +- {np.std(per):.3f}  pooled {results[name][2]:.3f}  '
+            per_r.append(auroc(oof[te], Y[te], WR[te]))
+        b = AB == 'B'
+        results[name] = (np.mean(per), np.std(per), auroc(oof, Y, W), oof, np.mean(per_r), np.std(per_r),
+                         auroc(oof[b], Y[b], W[b]))
+        print(f'{name:18s} AUROC fold mean {np.mean(per):.3f} +- {np.std(per):.3f}  real mix {np.mean(per_r):.3f} '
+              f'+- {np.std(per_r):.3f}  within B {results[name][6]:.3f}  '
               f'folds {" ".join(f"{a:.3f}" for a in per)}', flush=True)
 
     print('single features (pooled AUROC; < 0.5 means the feature points to "not on this floor"):')
@@ -189,8 +231,6 @@ def main():
 
     best = 'mlp64 x+onehot'
     print(f'{best} pooled AUROC per category / A-B:')
-    eps = {e['id']: e for e in json.load(open(os.path.join(args.runs, 'episodes.json')))}
-    AB = np.array(['A' if eps[e]['goal_on_start_floor'] else 'B' for e in E])
     oof = results[best][3]
     for c in CATEGORIES:
         m = C == c
@@ -202,10 +242,12 @@ def main():
     with open(os.path.join(args.out, 'oof.csv'), 'w', newline='') as f:
         wr = csv.writer(f)
         names = list(results)
-        wr.writerow(['id', 't', 'category', 'ab', 'y', 'w'] + names)
+        wr.writerow(['id', 't', 'category', 'ab', 'y', 'w', 'w_real'] + names)
         for i in range(len(Y)):
-            wr.writerow([E[i], T[i], C[i], AB[i], Y[i], f'{W[i]:.6g}'] + [f'{results[n][3][i]:.4f}' for n in names])
-    json.dump({n: dict(mean=r[0], std=r[1], pooled=r[2]) for n, r in results.items()},
+            wr.writerow([E[i], T[i], C[i], AB[i], Y[i], f'{W[i]:.6g}', f'{WR[i]:.6g}']
+                        + [f'{results[n][3][i]:.4f}' for n in names])
+    json.dump({n: dict(mean=r[0], std=r[1], pooled=r[2], real_mean=r[4], real_std=r[5], within_b=r[6])
+               for n, r in results.items()},
               open(os.path.join(args.out, 'auroc.json'), 'w'), indent=1)
 
 
