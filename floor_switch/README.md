@@ -19,6 +19,22 @@ that the target is on the robot's current floor, and decides Stay / Switch.
 - `scripts/train_baseline.py`: logistic / MLP baselines, scene-grouped 5-fold CV (needs torch,
   e.g. `conda activate blip2`); `--rooms <dir>` adds the room histogram (24 features).
 
+- `scripts/calibrate.py`: per-category calibration (plan sec. 8.5) and its reliability check
+  (ECE, Brier), with Platt scaling (slope + offset per category, fitted on the other folds) as
+  the fallback; writes the constants and the out-of-fold calibrated p.
+- `scripts/decision_constants.py`: cost guard constants from the records (actions per metre,
+  climb actions, margin with Kaplan-Meier on censored failures).
+- `scripts/select_rule.py`: replays the v0 switch rule on the out-of-fold p and chooses X and tau
+  (saved actions, wrong-switch rate, net), with the B share 15-30 % sensitivity.
+
+v0 choices (train scenes, `~/objectnav_runs/floor_switch/p_model/catw/`):
+- p model: MLP32 (x 24 + one-hot), trained with per-category episode weights (`--cat-weights`).
+- calibration: Platt, p = sigmoid(0.251 x logit + offset[category]) (`calibration.json`); the
+  sec. 8.5 constant shift leaves ECE 0.131 (the logits are ~4x too confident), Platt 0.050.
+- rule: switch when the last 45 p (1 s) are all below 0.80, not while tracking a target, and only
+  if actions left >= 7.23 x stair distance (m) + 96 (climb p75) + 75 (margin)
+  (`decision_constants.json`, `rule_selection.json`).
+
 Room histogram setting in use: margin 0.075, T 0.1 (`rooms/m0.075_T0.1`), the best of
 margin {0, 0.02, 0.045, 0.075} x T {0.01, 0.02, 0.05, 0.1} in CV (differences within the fold spread).
 
