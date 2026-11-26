@@ -69,6 +69,12 @@ def generate_launch_description():
                               description='frames with a detection before a cluster is a target'),
         DeclareLaunchArgument('debug_dump_dir', default_value='',
                               description='save the voxel map around every climb stop here (diagnostics)'),
+        DeclareLaunchArgument('floor_switch', default_value='off', choices=['off', 'shadow', 'on'],
+                              description='floor-switch model (floor_switch package, v0): off; shadow = '
+                                          'floor_switch_node runs and records p, the exploration is unchanged; '
+                                          'on = frontier_goal switches floors on it (blip2_server needed)'),
+        DeclareLaunchArgument('floor_switch_model',
+                              default_value=os.path.expanduser('~/objectnav_runs/floor_switch/p_model/catw/online_model.json')),
         DeclareLaunchArgument('record_dir', default_value='',
                               description='periodic state of voxel_mapper / frontier_goal / instance_map as '
                                           'JSON Lines here (offline datasets; empty = off)'),
@@ -153,6 +159,7 @@ def generate_launch_description():
                      'stuck_close_tight': ParameterValue(PythonExpression(
                          ["'", LaunchConfiguration('guard_mode'), "' != 'path_only'"]), value_type=bool),
                      'debug_dump_dir': LaunchConfiguration('debug_dump_dir'),
+                     'record_publish': ParameterValue(PythonExpression(["'", LaunchConfiguration('floor_switch'), "' != 'off'"]), value_type=bool),
                      'record_dir': LaunchConfiguration('record_dir')}])
 
     # SAM3 segmentation (start sam3_server.py in the sam3 conda env first): the class image of the
@@ -175,6 +182,7 @@ def generate_launch_description():
                      'min_confidence': ParameterValue(LaunchConfiguration('instance_min_confidence'), value_type=float),
                      'min_count': ParameterValue(LaunchConfiguration('instance_min_count'), value_type=int),
                      'min_detections': ParameterValue(LaunchConfiguration('instance_min_detections'), value_type=int),
+                     'record_publish': ParameterValue(PythonExpression(["'", LaunchConfiguration('floor_switch'), "' != 'off'"]), value_type=bool),
                      'record_dir': LaunchConfiguration('record_dir')}])
     # spatial value map (Sec. V-B): BLIP-2 image-text relevance of the target (start blip2_server.py
     # in the blip2 conda env first); only with a target
@@ -197,8 +205,21 @@ def generate_launch_description():
                          ["3.0 if '", LaunchConfiguration('value_map'), "'.lower() == 'true' else 0.0"]),
                          value_type=float),
                      'stair_landmark_topic': 'voxel_map/stair_landmarks_checked',
+                     'record_publish': ParameterValue(PythonExpression(["'", LaunchConfiguration('floor_switch'), "' != 'off'"]), value_type=bool),
+                     'floor_switch_enable': ParameterValue(PythonExpression(
+                         ["'", LaunchConfiguration('floor_switch'), "' == 'on'"]), value_type=bool),
                      'record_dir': LaunchConfiguration('record_dir'),
                      'inflation_radius': ParameterValue(LaunchConfiguration('inflation_radius'), value_type=float)}])     # = voxel_mapper robot_radius (d_obs in eq. 16)
+
+    # floor-switch model (floor_switch package, v0): p of the target on this floor from the records
+    # of voxel_mapper / instance_map / frontier_goal (record_publish) and the room types (BLIP-2 ITC
+    # on blip2_server); frontier_goal switches floors on it with floor_switch:=on
+    floor_switch = Node(
+        package='floor_switch', executable='floor_switch_node', name='floor_switch', output='screen',
+        condition=IfCondition(PythonExpression(["'", LaunchConfiguration('floor_switch'), "' != 'off'"])),
+        parameters=[{'use_sim_time': True, 'model': LaunchConfiguration('floor_switch_model'),
+                     'blip2_address': LaunchConfiguration('blip2_address'),
+                     'record_dir': LaunchConfiguration('record_dir')}])
 
     # Nav2 as in nav2_bringup navigation_launch.py, without the planner_server: the global path
     # is planned on the 3-D support graph of the voxel map (TravExplorer Sec. VI-B) by
@@ -274,5 +295,6 @@ def generate_launch_description():
         parameters=[{'use_sim_time': True}],
         condition=IfCondition(LaunchConfiguration('rviz')))
 
-    return LaunchDescription(args + [bridge, bridge_unguarded, guard, voxel, segmenter, instances, itm, goals, nav2, explorer,
+    return LaunchDescription(args + [bridge, bridge_unguarded, guard, voxel, segmenter, instances, itm, goals, floor_switch, nav2,
+                                     explorer,
                                      rviz])

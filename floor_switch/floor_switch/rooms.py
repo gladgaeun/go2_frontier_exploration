@@ -72,6 +72,21 @@ def depth_points(depth, hfov_deg, cam_pos, yaw, pitch):
     return np.stack([X[ok], Y[ok], Z[ok]], 1), conf[ok]
 
 
+def optical_points(depth, hfov_deg, cam_pos, cam_R):
+    """depth_points() for a camera pose from TF (online): cam_R rotates the optical frame
+    (x right, y down, z forward; REP-103) into the map frame. Same pixels, range and confidence."""
+    h, w = depth.shape
+    f = (w / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+    u, v = np.meshgrid(np.arange(w) + 0.5, np.arange(h) + 0.5)
+    d = depth.astype(np.float64)
+    ok = np.isfinite(d) & (d > 0.05) & (d <= MAX_RANGE)
+    x_r, y_d = (u - w / 2.0) / f, (v - h / 2.0) / f
+    ray = np.stack([x_r[ok] * d[ok], y_d[ok] * d[ok], d[ok]], 1)
+    ang = np.arctan(np.hypot(x_r, y_d))
+    conf = np.cos(np.clip(ang / math.radians(hfov_deg / 2.0), 0, 1) * math.pi / 2.0) ** 2
+    return ray @ np.asarray(cam_R).T + np.asarray(cam_pos), conf[ok]
+
+
 class _FloorGrid:
     """Fused similarities of one floor on a dense grid that grows with the map, and the sums of
     softmax(similarity / T) over its observed cells per temperature."""

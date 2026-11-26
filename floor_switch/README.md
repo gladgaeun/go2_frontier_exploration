@@ -27,8 +27,24 @@ that the target is on the robot's current floor, and decides Stay / Switch.
 - `scripts/select_rule.py`: replays the v0 switch rule on the out-of-fold p and chooses X and tau
   (saved actions, wrong-switch rate, net), with the B share 15-30 % sensitivity.
 
+- `scripts/export_model.py`: the five CV fold models (MLP32, rebuilt with the CV's folds, seeds and
+  settings, each checked against its out-of-fold logits in `oof.csv`) with the Platt and rule
+  constants -> `online_model.json`; online logit = the mean of the five (the Platt constants were
+  fitted on these models' out-of-fold logits). Numpy forward checked against torch; sim_dev check.
+- `floor_switch/model.py`, `floor_switch/rule.py`: the p model in numpy and the switch rule
+  (history, cost guard), shared by the node and `select_rule.py`.
+- `floor_switch/floor_switch_node.py` (online, v0): reads the records of voxel_mapper /
+  instance_map / frontier_goal on `record/*` (trav_exploration recorder, `record_publish`), counts
+  actions from TF, sends a frame per decision time to blip2_server (`itc` request) for the room map,
+  and publishes p and `ready` on `floor_switch/state`. frontier_goal_node switches at its decision
+  times (rank-0 requests, every 10 s) with `floor_switch_enable`: the floor gets a defer flag,
+  reliable stairs to a floor neither explored nor deferred, no climb abort for new frontiers.
+  Launch: `hm3d_trav_exploration.launch.py floor_switch:=off|shadow|on` (shadow: p recorded in
+  `<record_dir>/floor_switch.jsonl`, exploration unchanged).
+
 v0 choices (train scenes, `~/objectnav_runs/floor_switch/p_model/catw/`):
-- p model: MLP32 (x 24 + one-hot), trained with per-category episode weights (`--cat-weights`).
+- p model: MLP32 (x 24 + one-hot), trained with per-category episode weights (`--cat-weights`;
+  `--mlp-epochs 200 --mlp-lr 3e-3 --mlp-wd 1e-3`); online: the mean logit of the five fold models.
 - calibration: Platt, p = sigmoid(0.251 x logit + offset[category]) (`calibration.json`); the
   sec. 8.5 constant shift leaves ECE 0.131 (the logits are ~4x too confident), Platt 0.050.
 - rule: switch when the last 45 p (1 s) are all below 0.80, not while tracking a target, and only
