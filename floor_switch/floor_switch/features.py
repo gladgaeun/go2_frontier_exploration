@@ -16,9 +16,6 @@ import math
 
 import numpy as np
 
-# the instance map's label of each ObjectNav category (prepare_episodes.PROMPTS)
-PROMPTS = {'chair': 'chair', 'bed': 'bed', 'plant': 'potted plant', 'toilet': 'toilet',
-           'tv_monitor': 'tv', 'sofa': 'couch'}
 CATEGORIES = ('chair', 'bed', 'plant', 'toilet', 'tv_monitor', 'sofa')
 
 NAMES = ('area', 'n_frontier', 'frontier_size', 'dwell', 'cand_gamma', 'cand_pos', 'cand_neg',
@@ -93,7 +90,11 @@ class FloorFeatures:
 
     def __init__(self, target):
         self.target = target
-        self.label = PROMPTS.get(target, target)
+        # the instance map labels its clusters with the category name, the part before '=' of the
+        # launch target "name=prompt" (plant=potted plant: label 'plant'); the prompt only goes to
+        # SAM3 / BLIP-2. Before 2026-11-26 the prompt was taken here: plant, sofa and tv_monitor
+        # never matched and their candidate features were always 0.
+        self.label = target
         self.ft = FloorTracker()
         self.dwell = {}                    # floor index -> actions spent on it
         self.last_actions = None
